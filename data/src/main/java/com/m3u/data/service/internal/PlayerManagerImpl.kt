@@ -327,10 +327,9 @@ class PlayerManagerImpl @Inject constructor(
                 (licenseType in arrayOf(
                     Channel.LICENSE_TYPE_CLEAR_KEY,
                     Channel.LICENSE_TYPE_CLEAR_KEY_2
-                )) && !licenseKey.startsWith("http") -> LocalMediaDrmCallback(licenseKey.toByteArray())
-
+                )) && !processedLicenseKey.startsWith("http") -> LocalMediaDrmCallback(processedLicenseKey.toByteArray())
                 else -> HttpMediaDrmCallback(
-                    licenseKey,
+                    processedLicenseKey,
                     dataSourceFactory
                 )
             }
