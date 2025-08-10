@@ -4,6 +4,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.net.Uri
+import android.util.Base64
+import org.json.JSONObject
 import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -291,6 +293,36 @@ class PlayerManagerImpl @Inject constructor(
         }
         logger.post { "media-source-factory: ${mediaSourceFactory::class.qualifiedName}" }
         if (licenseType.isNotEmpty()) {
+            val processedLicenseKey = when {
+                licenseKey.matches(Regex("^[0-9a-fA-F]{32}:[0-9a-fA-F]{32}\$")) -> {
+                    val parts = licenseKey.split(":")
+                    val keyId = parts[0].toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
+                    val key = parts[1].toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
+                    """{"keys":[{"kty":"oct","kid":"$keyId","k":"$key"}],"type":"temporary"}"""
+                }
+                licenseKey.matches(Regex("^\"[0-9a-fA-F]{32}\":\"[0-9a-fA-F]{32}\"\$")) -> {
+                    val cleanKey = licenseKey.replace("\"", "")
+                    val parts = cleanKey.split(":")
+                    val keyId = parts[0].toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
+                    val key = parts[1].toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
+                    """{"keys":[{"kty":"oct","kid":"$keyId","k":"$key"}],"type":"temporary"}"""
+                }
+                licenseKey.matches(Regex("^\\{(\"[0-9a-fA-F]{32}\":\"[0-9a-fA-F]{32}\"(,(\"[0-9a-fA-F]{32}\":\"[0-9a-fA-F]{32}\"))*)?\\}\$")) -> {
+                    try {
+                        val jsonObject = JSONObject(licenseKey)
+                        val keysArray = jsonObject.keys().asSequence().map { keyId ->
+                            val key = jsonObject.getString(keyId)
+                            val keyIdBase64 = keyId.replace("\"", "").toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
+                            val keyBase64 = key.replace("\"", "").toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
+                            """{"kty":"oct","kid":"$keyIdBase64","k":"$keyBase64"}"""
+                        }.joinToString(",", "[", "]")
+                        """{"keys":$keysArray,"type":"temporary"}"""
+                    } catch (e: Exception) {
+                        licenseKey
+                    }
+                }
+                else -> licenseKey
+            }
             val drmCallback = when {
                 (licenseType in arrayOf(
                     Channel.LICENSE_TYPE_CLEAR_KEY,
