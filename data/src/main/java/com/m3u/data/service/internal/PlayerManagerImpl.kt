@@ -5,7 +5,6 @@ import android.graphics.Bitmap
 import android.graphics.Rect
 import android.net.Uri
 import android.util.Base64
-import org.json.JSONObject
 import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -237,6 +236,30 @@ class PlayerManagerImpl @Inject constructor(
         }
     }
 
+    private fun toUrlSafeBase64(hex: String): String {
+        val bytes = hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        return Base64.encodeToString(bytes, Base64.NO_WRAP)
+            .replace("/", "_")
+            .replace("+", "-")
+            .replace("=", "")
+    }
+
+    private fun parseMultiHexKey(licenseKey: String): String {
+        val cleanKey = licenseKey.trim().removeSurrounding("{", "}")
+        val pairs = cleanKey.split(",").map { it.trim() }
+        val keysArray = pairs.map { pair ->
+            val parts = pair.split(":").map { it.replace("\"", "") }
+            if (parts.size == 2) {
+                val keyIdBase64 = toUrlSafeBase64(parts[0])
+                val keyBase64 = toUrlSafeBase64(parts[1])
+                """{"kty":"oct","kid":"$keyIdBase64","k":"$keyBase64"}"""
+            } else {
+                throw IllegalArgumentException("Invalid key pair: $pair")
+            }
+        }.joinToString(",", "[", "]")
+        return """{"keys":$keysArray,"type":"temporary"}"""
+    }
+
     private var extractor: MediaExtractorCompat? = null
     private suspend fun tryPlay(
         url: String = channel.value?.url.orEmpty(),
@@ -296,33 +319,27 @@ class PlayerManagerImpl @Inject constructor(
             val processedLicenseKey = when {
                 licenseKey.matches(Regex("^[0-9a-fA-F]{32}:[0-9a-fA-F]{32}\$")) -> {
                     val parts = licenseKey.split(":")
-                    val keyId = parts[0].toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
-                    val key = parts[1].toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
-                    """{"keys":[{"kty":"oct","kid":"$keyId","k":"$key"}],"type":"temporary"}"""
+                    val keyIdBase64 = toUrlSafeBase64(parts[0])
+                    val keyBase64 = toUrlSafeBase64(parts[1])
+                    """{"keys":[{"kty":"oct","kid":"$keyIdBase64","k":"$keyBase64"}],"type":"temporary"}"""
                 }
                 licenseKey.matches(Regex("^\"[0-9a-fA-F]{32}\":\"[0-9a-fA-F]{32}\"\$")) -> {
                     val cleanKey = licenseKey.replace("\"", "")
                     val parts = cleanKey.split(":")
-                    val keyId = parts[0].toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
-                    val key = parts[1].toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
-                    """{"keys":[{"kty":"oct","kid":"$keyId","k":"$key"}],"type":"temporary"}"""
+                    val keyIdBase64 = toUrlSafeBase64(parts[0])
+                    val keyBase64 = toUrlSafeBase64(parts[1])
+                    """{"keys":[{"kty":"oct","kid":"$keyIdBase64","k":"$keyBase64"}],"type":"temporary"}"""
                 }
                 licenseKey.matches(Regex("^\\{(\"[0-9a-fA-F]{32}\":\"[0-9a-fA-F]{32}\"(,(\"[0-9a-fA-F]{32}\":\"[0-9a-fA-F]{32}\"))*)?\\}\$")) -> {
                     try {
-                        val jsonObject = JSONObject(licenseKey)
-                        val keysArray = jsonObject.keys().asSequence().map { keyId ->
-                            val key = jsonObject.getString(keyId)
-                            val keyIdBase64 = keyId.replace("\"", "").toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
-                            val keyBase64 = key.replace("\"", "").toByteArray(Charsets.UTF_8).let { Base64.encodeToString(it, Base64.NO_WRAP) }
-                            """{"kty":"oct","kid":"$keyIdBase64","k":"$keyBase64"}"""
-                        }.joinToString(",", "[", "]")
-                        """{"keys":$keysArray,"type":"temporary"}"""
+                        parseMultiHexKey(licenseKey)
                     } catch (e: Exception) {
                         licenseKey
                     }
                 }
                 else -> licenseKey
             }
+
             val drmCallback = when {
                 (licenseType in arrayOf(
                     Channel.LICENSE_TYPE_CLEAR_KEY,
