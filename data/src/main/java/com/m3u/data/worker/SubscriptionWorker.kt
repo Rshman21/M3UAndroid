@@ -101,26 +101,19 @@ class SubscriptionWorker @AssistedInject constructor(
                         Result.success()
                     }
                 }
-
+                
+                // ... EPG 和 Xtream 部分保持不变，但为了节省篇幅我省略了 ...
+                // 确保你的文件里包含它们
                 DataSource.EPG -> {
                     val playlistUrl = epgPlaylistUrl ?: return@coroutineScope Result.failure()
                     val ignoreCache = epgIgnoreCache
-                    programmeRepository.checkOrRefreshProgrammesOrThrow(
-                        playlistUrl,
-                        ignoreCache = ignoreCache
-                    )
+                    programmeRepository.checkOrRefreshProgrammesOrThrow(playlistUrl, ignoreCache = ignoreCache)
                         .onEach { count ->
-                            val notification = createN10nBuilder()
-                                .setContentText(findProgrammeProgressContentText(count))
-                                .setActions(cancelAction)
-                                .setOngoing(true)
-                                .build()
+                            val notification = createN10nBuilder().setContentText(findProgrammeProgressContentText(count)).setActions(cancelAction).setOngoing(true).build()
                             notificationManager.notify(notificationId, notification)
-                        }
-                        .launchIn(this)
+                        }.launchIn(this)
                     Result.success()
                 }
-
                 DataSource.Xtream -> {
                     title ?: return@coroutineScope Result.failure()
                     basicUrl ?: return@coroutineScope Result.failure()
@@ -133,29 +126,19 @@ class SubscriptionWorker @AssistedInject constructor(
                     } else {
                         val type = url?.let { XtreamInput.decodeFromPlaylistUrlOrNull(it)?.type }
                         var total = 0
-                        playlistRepository.xtreamOrThrow(
-                            title, basicUrl, username, password, type
-                        ) { count ->
+                        playlistRepository.xtreamOrThrow(title, basicUrl, username, password, type) { count ->
                             total = count
-                            val notification = createN10nBuilder()
-                                .setContentText(findChannelProgressContentText(count))
-                                .setActions(cancelAction)
-                                .setOngoing(true)
-                                .build()
+                            val notification = createN10nBuilder().setContentText(findChannelProgressContentText(count)).setActions(cancelAction).setOngoing(true).build()
                             notificationManager.notify(notificationId, notification)
                         }
-                        createN10nBuilder()
-                            .setContentText(findCompleteContentText(total))
-                            .setOngoing(false)
-                            .setAutoCancel(true)
-                            .buildThenNotify()
+                        createN10nBuilder().setContentText(findCompleteContentText(total)).setOngoing(false).setAutoCancel(true).buildThenNotify()
                         Result.success()
                     }
                 }
-
                 else -> Result.failure()
             }
-        } catch (e: Exception) {
+        // 【关键修改】使用 Throwable 捕获所有可能的错误（包括 OutOfMemory, StackOverflow）
+        } catch (e: Throwable) {
             e.printStackTrace()
             notifyError(e.localizedMessage.orEmpty())
             Result.failure()
@@ -166,7 +149,6 @@ class SubscriptionWorker @AssistedInject constructor(
         val notification = createN10nBuilder()
             .setContentTitle("Update Failed") 
             .setContentText(message)
-            // 【关键修改】使用存在的图标，并移除了 setColor 以避免编译问题
             .setSmallIcon(R.drawable.round_cancel_24) 
             .setOngoing(false)
             .setAutoCancel(true)
@@ -174,59 +156,17 @@ class SubscriptionWorker @AssistedInject constructor(
         notificationManager.notify(notificationId, notification)
     }
 
-    private fun createChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID, NOTIFICATION_NAME, NotificationManager.IMPORTANCE_LOW
-        )
-        channel.description = "display subscribe task progress"
-        notificationManager.createNotificationChannel(channel)
-    }
-
-    private fun Notification.Builder.buildThenNotify() {
-        notificationManager.notify(notificationId, build())
-    }
-
-    override suspend fun getForegroundInfo(): ForegroundInfo {
-        return ForegroundInfo(notificationId, createN10nBuilder().build())
-    }
-
-    private fun createN10nBuilder(): Notification.Builder =
-        Notification.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.drawable.round_file_download_24)
-            .setContentTitle(
-                when (dataSource) {
-                    DataSource.EPG -> epgPlaylistUrl
-                    else -> title
-                }
-            )
-            .setOngoing(true)
-
-    private fun findCancelActionTitle() =
-        context.getString(string.data_worker_subscription_action_cancel)
-
-    private fun findRetryActionTitle() =
-        context.getString(string.data_worker_subscription_action_retry)
-
-    private fun findCompleteContentText(total: Int) =
-        context.getString(string.data_worker_subscription_content_completed, total)
-
-    private fun findChannelProgressContentText(count: Int) =
-        context.getString(string.data_worker_subscription_content_channel_progress, count)
-
-    private fun findProgrammeProgressContentText(count: Int) =
-        context.getString(string.data_worker_subscription_content_programme_progress, count)
-
-    private val cancelAction: Notification.Action by lazy {
-        Notification.Action.Builder(
-            Icon.createWithResource(
-                context,
-                R.drawable.round_cancel_24
-            ),
-            findCancelActionTitle(),
-            workManager.createCancelPendingIntent(id)
-        )
-            .build()
-    }
+    // [其余辅助方法和 Companion object 保持不变，直接复制之前的]
+    private fun createChannel() { val channel = NotificationChannel(CHANNEL_ID, NOTIFICATION_NAME, NotificationManager.IMPORTANCE_LOW); channel.description = "display subscribe task progress"; notificationManager.createNotificationChannel(channel) }
+    private fun Notification.Builder.buildThenNotify() { notificationManager.notify(notificationId, build()) }
+    override suspend fun getForegroundInfo(): ForegroundInfo { return ForegroundInfo(notificationId, createN10nBuilder().build()) }
+    private fun createN10nBuilder(): Notification.Builder = Notification.Builder(context, CHANNEL_ID).setSmallIcon(R.drawable.round_file_download_24).setContentTitle(when (dataSource) { DataSource.EPG -> epgPlaylistUrl; else -> title }).setOngoing(true)
+    private fun findCancelActionTitle() = context.getString(string.data_worker_subscription_action_cancel)
+    private fun findRetryActionTitle() = context.getString(string.data_worker_subscription_action_retry)
+    private fun findCompleteContentText(total: Int) = context.getString(string.data_worker_subscription_content_completed, total)
+    private fun findChannelProgressContentText(count: Int) = context.getString(string.data_worker_subscription_content_channel_progress, count)
+    private fun findProgrammeProgressContentText(count: Int) = context.getString(string.data_worker_subscription_content_programme_progress, count)
+    private val cancelAction: Notification.Action by lazy { Notification.Action.Builder(Icon.createWithResource(context, R.drawable.round_cancel_24), findCancelActionTitle(), workManager.createCancelPendingIntent(id)).build() }
     
     companion object {
         private const val CHANNEL_ID = "subscribe_channel"
@@ -241,40 +181,9 @@ class SubscriptionWorker @AssistedInject constructor(
         private const val INPUT_STRING_DATA_SOURCE_VALUE = "data-source"
         const val TAG = "subscription"
         
-        fun m3u(workManager: WorkManager, title: String, url: String) {
-             workManager.cancelAllWorkByTag(url)
-             val request = OneTimeWorkRequestBuilder<SubscriptionWorker>()
-                 .setInputData(workDataOf(INPUT_STRING_TITLE to title, INPUT_STRING_URL to url, INPUT_STRING_DATA_SOURCE_VALUE to DataSource.M3U.value))
-                 .addTag(url).addTag(TAG).addTag(DataSource.M3U.value)
-                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                 .build()
-             workManager.enqueue(request)
-        }
-        
-        fun epg(workManager: WorkManager, playlistUrl: String, ignoreCache: Boolean) {
-            workManager.cancelAllWorkByTag(playlistUrl)
-            val request = OneTimeWorkRequestBuilder<SubscriptionWorker>()
-                .setInputData(workDataOf(INPUT_STRING_EPG_PLAYLIST_URL to playlistUrl, INPUT_BOOLEAN_EPG_IGNORE_CACHE to ignoreCache, INPUT_STRING_DATA_SOURCE_VALUE to DataSource.EPG.value))
-                .addTag(playlistUrl).addTag(TAG).addTag(DataSource.EPG.value)
-                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                .build()
-            workManager.enqueue(request)
-        }
-        
-        fun xtream(workManager: WorkManager, title: String, url: String, basicUrl: String, username: String, password: String) {
-            workManager.cancelAllWorkByTag(url)
-            workManager.cancelAllWorkByTag(basicUrl)
-            val request = OneTimeWorkRequestBuilder<SubscriptionWorker>()
-                .setInputData(workDataOf(INPUT_STRING_TITLE to title, INPUT_STRING_URL to url, INPUT_STRING_BASIC_URL to basicUrl, INPUT_STRING_USERNAME to username, INPUT_STRING_PASSWORD to password, INPUT_STRING_DATA_SOURCE_VALUE to DataSource.Xtream.value))
-                .addTag(url).addTag(basicUrl).addTag(DataSource.Xtream.value).addTag(TAG)
-                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                .build()
-            workManager.enqueue(request)
-        }
-
+        fun m3u(workManager: WorkManager, title: String, url: String) { workManager.cancelAllWorkByTag(url); val request = OneTimeWorkRequestBuilder<SubscriptionWorker>().setInputData(workDataOf(INPUT_STRING_TITLE to title, INPUT_STRING_URL to url, INPUT_STRING_DATA_SOURCE_VALUE to DataSource.M3U.value)).addTag(url).addTag(TAG).addTag(DataSource.M3U.value).setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST).setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).build(); workManager.enqueue(request) }
+        fun epg(workManager: WorkManager, playlistUrl: String, ignoreCache: Boolean) { workManager.cancelAllWorkByTag(playlistUrl); val request = OneTimeWorkRequestBuilder<SubscriptionWorker>().setInputData(workDataOf(INPUT_STRING_EPG_PLAYLIST_URL to playlistUrl, INPUT_BOOLEAN_EPG_IGNORE_CACHE to ignoreCache, INPUT_STRING_DATA_SOURCE_VALUE to DataSource.EPG.value)).addTag(playlistUrl).addTag(TAG).addTag(DataSource.EPG.value).setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST).setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).build(); workManager.enqueue(request) }
+        fun xtream(workManager: WorkManager, title: String, url: String, basicUrl: String, username: String, password: String) { workManager.cancelAllWorkByTag(url); workManager.cancelAllWorkByTag(basicUrl); val request = OneTimeWorkRequestBuilder<SubscriptionWorker>().setInputData(workDataOf(INPUT_STRING_TITLE to title, INPUT_STRING_URL to url, INPUT_STRING_BASIC_URL to basicUrl, INPUT_STRING_USERNAME to username, INPUT_STRING_PASSWORD to password, INPUT_STRING_DATA_SOURCE_VALUE to DataSource.Xtream.value)).addTag(url).addTag(basicUrl).addTag(DataSource.Xtream.value).addTag(TAG).setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST).setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).build(); workManager.enqueue(request) }
         private val ATOMIC_NOTIFICATION_ID = AtomicInteger()
     }
 }
