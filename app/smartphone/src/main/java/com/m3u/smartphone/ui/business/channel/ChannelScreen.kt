@@ -43,6 +43,11 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.paging.compose.collectAsLazyPagingItems
+import android.content.res.Configuration
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.asPaddingValues
 import com.google.accompanist.permissions.rememberPermissionState
 import com.m3u.business.channel.ChannelViewModel
 import com.m3u.business.channel.PlayerState
@@ -141,6 +146,14 @@ fun ChannelRoute(
         pullPanelLayoutState.expand()
     }
 
+    LaunchedEffect(configuration.orientation) {
+        if (configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+            pullPanelLayoutState.collapse()
+        } else {
+            pullPanelLayoutState.expand()
+        }
+    }
+
     val isPanelExpanded = pullPanelLayoutState.isExpanded
     val fraction = pullPanelLayoutState.fraction
 
@@ -224,8 +237,12 @@ fun ChannelRoute(
 
     var currentPaddings: Paddings by remember { mutableStateOf(Paddings()) }
     val onPaddingsChanged = { paddings: Paddings -> currentPaddings = paddings }
+
+    val safeDrawingPadding = WindowInsets.safeDrawing.asPaddingValues()
+    val systemTopPadding = safeDrawingPadding.calculateTopPadding()
+
     val topPadding by animateDpAsState(
-        currentPaddings.top.takeOrElse { 0.dp }.takeIf { isPanelExpanded } ?: 0.dp
+        if (isPanelExpanded) systemTopPadding else 0.dp
     )
     val bottomPadding by animateDpAsState(
         currentPaddings.bottom.takeOrElse { 0.dp }.takeIf { isPanelExpanded } ?: 0.dp
