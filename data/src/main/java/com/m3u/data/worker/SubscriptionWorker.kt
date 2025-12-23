@@ -102,30 +102,63 @@ class SubscriptionWorker @AssistedInject constructor(
                     }
                 }
                 
-                // 其他类型逻辑保持不变...
                 DataSource.EPG -> {
                     val playlistUrl = epgPlaylistUrl ?: return@coroutineScope Result.failure()
-                    programmeRepository.checkOrRefreshProgrammesOrThrow(playlistUrl, epgIgnoreCache).onEach { count ->
-                        val notification = createN10nBuilder().setContentText(findProgrammeProgressContentText(count)).setActions(cancelAction).setOngoing(true).build()
-                        notificationManager.notify(notificationId, notification)
-                    }.launchIn(this)
+                    // 【修复】根据报错信息，这里需要传递 (String, String, Boolean)
+                    // 参数1: playlistUrl, 参数2: epgUrl (这里也是 playlistUrl), 参数3: ignoreCache
+                    programmeRepository.checkOrRefreshProgrammesOrThrow(
+                        playlistUrl = playlistUrl,
+                        epgUrl = playlistUrl, 
+                        ignoreCache = epgIgnoreCache
+                    )
+                        .onEach { count ->
+                            val notification = createN10nBuilder()
+                                .setContentText(findProgrammeProgressContentText(count))
+                                .setActions(cancelAction)
+                                .setOngoing(true)
+                                .build()
+                            notificationManager.notify(notificationId, notification)
+                        }
+                        .launchIn(this)
                     Result.success()
                 }
+
                 DataSource.Xtream -> {
                     title ?: return@coroutineScope Result.failure()
-                    val type = url?.let { XtreamInput.decodeFromPlaylistUrlOrNull(it)?.type }
-                    var total = 0
-                    playlistRepository.xtreamOrThrow(title, basicUrl ?: "", username ?: "", password ?: "", type) { count ->
-                        total = count
-                        val notification = createN10nBuilder().setContentText(findChannelProgressContentText(count)).setActions(cancelAction).setOngoing(true).build()
-                        notificationManager.notify(notificationId, notification)
+                    // 确保 basicUrl 不为空，虽然上面已有检查，但这里用 Elvis 这里的检查更安全
+                    val basicUrlSafe = basicUrl ?: return@coroutineScope Result.failure()
+                    val usernameSafe = username ?: return@coroutineScope Result.failure()
+                    val passwordSafe = password ?: return@coroutineScope Result.failure()
+
+                    if (title.isEmpty()) {
+                        url ?: return@coroutineScope Result.failure()
+                        notifyError(context.getString(string.data_error_empty_title))
+                        Result.failure()
+                    } else {
+                        val type = url?.let { XtreamInput.decodeFromPlaylistUrlOrNull(it)?.type }
+                        var total = 0
+                        playlistRepository.xtreamOrThrow(
+                            title, basicUrlSafe, usernameSafe, passwordSafe, type
+                        ) { count ->
+                            total = count
+                            val notification = createN10nBuilder()
+                                .setContentText(findChannelProgressContentText(count))
+                                .setActions(cancelAction)
+                                .setOngoing(true)
+                                .build()
+                            notificationManager.notify(notificationId, notification)
+                        }
+                        createN10nBuilder()
+                            .setContentText(findCompleteContentText(total))
+                            .setOngoing(false)
+                            .setAutoCancel(true)
+                            .buildThenNotify()
+                        Result.success()
                     }
-                    createN10nBuilder().setContentText(findCompleteContentText(total)).setOngoing(false).setAutoCancel(true).buildThenNotify()
-                    Result.success()
                 }
                 else -> Result.failure()
             }
-        } catch (e: Throwable) { // 【关键】捕获 Throwable
+        } catch (e: Throwable) {
             e.printStackTrace()
             notifyError(e.message ?: "Unknown error")
             Result.failure()
@@ -143,8 +176,6 @@ class SubscriptionWorker @AssistedInject constructor(
         notificationManager.notify(notificationId, notification)
     }
 
-    // 辅助方法... (请直接复制你原来文件中的 createN10nBuilder, companion object 等代码)
-    // 务必包含 Companion Object，因为调用方需要用到 m3u/epg/xtream 静态方法
     private fun createChannel() { val channel = NotificationChannel(CHANNEL_ID, NOTIFICATION_NAME, NotificationManager.IMPORTANCE_LOW); channel.description = "display subscribe task progress"; notificationManager.createNotificationChannel(channel) }
     private fun Notification.Builder.buildThenNotify() { notificationManager.notify(notificationId, build()) }
     override suspend fun getForegroundInfo(): ForegroundInfo { return ForegroundInfo(notificationId, createN10nBuilder().build()) }
