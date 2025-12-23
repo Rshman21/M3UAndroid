@@ -36,6 +36,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-home-cache-cleanup: true
+          cache-read-only: false
 
       - name: Decode Keystore
         run: |
@@ -44,9 +45,12 @@ jobs:
       - name: Clean GMD
         run: ./gradlew cleanManagedDevices --unused-only
 
-      - name: Build production app
+      - name: Build production app (Mobile Only)
         run: |
           ./gradlew :app:smartphone:assembleRelease \
+            --parallel \
+            --build-cache \
+            -Pandroid.injected.build.abi.filters=arm64-v8a \
             -Pandroid.injected.signing.store.file=$(pwd)/release.jks \
             -Pandroid.injected.signing.store.password=${{ secrets.KEYSTORE_PASSWORD }} \
             -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS }} \
@@ -57,17 +61,22 @@ jobs:
             -Pandroid.experimental.androidTest.numManagedDeviceShards=1 \
             -Pandroid.experimental.testOptions.managedDevices.maxConcurrentDevices=1
 
-      - name: Build production tv app
-        run: |
-          ./gradlew :app:tv:assembleRelease \
-            -Pandroid.injected.signing.store.file=$(pwd)/release.jks \
-            -Pandroid.injected.signing.store.password=${{ secrets.KEYSTORE_PASSWORD }} \
-            -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS }} \
-            -Pandroid.injected.signing.key.password=${{ secrets.KEY_PASSWORD }}
+      # -----------------------------------------------------------------------
+      # - name: Build production tv app
+      #   run: |
+      #     ./gradlew :app:tv:assembleRelease \
+      #       --parallel \
+      #       --build-cache \
+      #       -Pandroid.injected.build.abi.filters=armeabi-v7a \
+      #       -Pandroid.injected.signing.store.file=$(pwd)/release.jks \
+      #       -Pandroid.injected.signing.store.password=${{ secrets.KEYSTORE_PASSWORD }} \
+      #       -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS }} \
+      #       -Pandroid.injected.signing.key.password=${{ secrets.KEY_PASSWORD }}
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
+          name: app-smartphone-arm64
           path: |
             app/smartphone/build/outputs/apk/release/*.apk
-            app/tv/build/outputs/apk/release/*.apk
+          # app/tv/build/outputs/apk/release/*.apk
