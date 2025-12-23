@@ -59,6 +59,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.paging.compose.LazyPagingItems
+import android.content.pm.ActivityInfo
 import coil.compose.SubcomposeAsyncImage
 import com.m3u.core.foundation.components.AbsoluteSmoothCornerShape
 import com.m3u.core.foundation.components.CircularProgressIndicator
@@ -84,6 +85,7 @@ import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
+
 
 @Composable
 internal fun PlayerPanel(
@@ -461,7 +463,10 @@ private fun ChannelGalleryItem(
         )
     }
     val onClick = lambda@{
-        if (isPlaying) return@lambda
+        if (isPlaying) {
+            helper.screenOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            return@lambda
+        }
         coroutineScope.launch {
             helper.play(
                 MediaCommand.Common(channel.id)
