@@ -105,6 +105,12 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             inputStream.use { input ->
                 m3uParser.parse(input.buffered())
                     .collect { m3uData ->
+                        // 【核心修复】过滤逻辑
+                        // 如果 URL 为空，或者是以 # 开头的注释（例如 #https://...），则跳过
+                        if (m3uData.url.isBlank() || m3uData.url.startsWith("#")) {
+                            return@collect
+                        }
+                        
                         newChannels.add(m3uData.toChannel(actualUrl))
                     }
             }
@@ -113,8 +119,10 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             throw e
         }
 
+        // 如果解析完发现全是无效数据（比如列表是空的，或者所有链接都被注释了）
+        // 抛出异常，Worker 会捕获并提示“更新失败”，且不会覆盖旧数据库
         if (newChannels.isEmpty()) {
-            throw RuntimeException("Stream list is empty, aborting update.")
+            throw RuntimeException("Stream list is empty or invalid, aborting update.")
         }
 
         // 3. 写入：数据准备完毕，现在开始安全的数据库事务操作
@@ -175,7 +183,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         val liveContainerExtension = if ("ts" in allowedOutputFormats) "ts"
         else allowedOutputFormats.firstOrNull() ?: "ts"
 
-        // 【关键修改】这里使用具名参数 source = DataSource.Xtream，解决了编译报错
         val livePlaylist = XtreamInput.encodeToPlaylistUrl(
             input = input.copy(type = DataSource.Xtream.TYPE_LIVE),
             serverProtocol = serverProtocol, port = port
