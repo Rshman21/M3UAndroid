@@ -146,6 +146,7 @@ fun ChannelRoute(
         pullPanelLayoutState.expand()
     }
 
+    val configuration = LocalConfiguration.current
     LaunchedEffect(configuration.orientation) {
         if (configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
             pullPanelLayoutState.collapse()
