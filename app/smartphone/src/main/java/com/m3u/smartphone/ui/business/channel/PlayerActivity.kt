@@ -25,28 +25,18 @@ import com.m3u.smartphone.ui.material.model.LocalHazeState
 import dagger.hilt.android.AndroidEntryPoint
 import dev.chrisbanes.haze.HazeState
 import kotlinx.coroutines.launch
-import java.lang.ref.WeakReference
 import javax.inject.Inject
 
 @AndroidEntryPoint
 class PlayerActivity : ComponentActivity() {
     private val viewModel: ChannelViewModel by viewModels()
+
     private val helper: Helper = Helper(this)
 
     companion object {
+        // FIXME: the property is worked only when activity has one instance at most.
         var isInPipMode: Boolean = false
             private set
-
-        private var pipActivityRef: WeakReference<PlayerActivity>? = null
-
-        fun closeExistingPip() {
-            pipActivityRef?.get()?.let { activity ->
-                if (!activity.isFinishing && !activity.isDestroyed) {
-                    activity.finish()
-                }
-            }
-            pipActivityRef = null
-        }
     }
 
     @Inject
@@ -56,7 +46,6 @@ class PlayerActivity : ComponentActivity() {
     lateinit var playlistRepository: PlaylistRepository
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        closeExistingPip()
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         handleIntent(intent)
@@ -67,21 +56,18 @@ class PlayerActivity : ComponentActivity() {
             ) {
                 val hazeState = remember { HazeState() }
                 CompositionLocalProvider(LocalHazeState provides hazeState) {
-                    Background(color = Color.Black) {
-                        ChannelRoute(viewModel = viewModel)
+                    Background(
+                        color = Color.Black
+                    ) {
+                        ChannelRoute(
+                            viewModel = viewModel
+                        )
                     }
                 }
             }
         }
         addOnPictureInPictureModeChangedListener {
             isInPipMode = it.isInPictureInPictureMode
-            if (it.isInPictureInPictureMode) {
-                pipActivityRef = WeakReference(this)
-            } else {
-                if (pipActivityRef?.get() == this) {
-                    pipActivityRef = null
-                }
-            }
             if (!it.isInPictureInPictureMode && lifecycle.currentState !in arrayOf(
                     Lifecycle.State.RESUMED,
                     Lifecycle.State.STARTED
@@ -97,30 +83,17 @@ class PlayerActivity : ComponentActivity() {
             val channel = channelRepository.get(channelId) ?: return@launch
             val playlist = playlistRepository.get(channel.playlistUrl)
             when {
+                // series can not be played from shortcuts
                 playlist?.isSeries == true -> {}
-                else -> helper.play(MediaCommand.Common(channel.id))
+                else -> {
+                    helper.play(MediaCommand.Common(channel.id))
+                }
             }
         }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-
-        if (isInPictureInPictureMode) {
-            val restartIntent = Intent(this, PlayerActivity::class.java)
-            
-            if (intent.extras != null) {
-                restartIntent.putExtras(intent.extras!!)
-            }
-            
-            restartIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK)
-            
-            startActivity(restartIntent)
-            
-            finish()
-            return
-        }
-
         handleIntent(intent)
     }
 
