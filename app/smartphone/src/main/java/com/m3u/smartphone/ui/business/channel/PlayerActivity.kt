@@ -1,6 +1,5 @@
 package com.m3u.smartphone.ui.business.channel
 
-import android.app.Activity
 import android.content.Intent
 import android.content.res.Configuration
 import android.os.Bundle
@@ -64,7 +63,6 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         closeExistingPip()
-
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         handleIntent(intent)
@@ -87,7 +85,6 @@ class PlayerActivity : ComponentActivity() {
         }
         addOnPictureInPictureModeChangedListener {
             isInPipMode = it.isInPictureInPictureMode
-            
             if (it.isInPictureInPictureMode) {
                 pipActivityRef = WeakReference(this)
             } else {
@@ -95,7 +92,6 @@ class PlayerActivity : ComponentActivity() {
                     pipActivityRef = null
                 }
             }
-
             if (!it.isInPictureInPictureMode && lifecycle.currentState !in arrayOf(
                     Lifecycle.State.RESUMED,
                     Lifecycle.State.STARTED
@@ -125,9 +121,13 @@ class PlayerActivity : ComponentActivity() {
         
         if (isInPictureInPictureMode) {
             finish()
+            val restartIntent = Intent(intent)
+            restartIntent.component = intent.component 
+            restartIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            applicationContext.startActivity(restartIntent)
             return
         }
-        
+
         handleIntent(intent)
     }
 
