@@ -87,11 +87,10 @@ class SubscriptionWorker @AssistedInject constructor(
                         .buildThenNotify()
                     Result.failure()
                 } else {
-                    // Added try-catch block for M3U update
+                    // 【核心修改】添加 try-catch 捕获异常，确保 UI 能显示“更新失败”
                     try {
                         var total = 0
-                        // This call will now throw an exception if parsing fails or times out
-                        // without clearing the database first.
+                        // 现在如果解析失败或超时，这里会抛出异常，不再静默
                         playlistRepository.m3uOrThrow(title, url) { count ->
                             total = count
                             val notification = createN10nBuilder()
@@ -107,14 +106,14 @@ class SubscriptionWorker @AssistedInject constructor(
                             .buildThenNotify()
                         Result.success()
                     } catch (e: Exception) {
-                        // Notify the user about the failure
+                        // 捕获异常后，发送红色错误通知
                         createN10nBuilder()
-                            .setContentText(e.localizedMessage.orEmpty())
+                            .setContentText(e.localizedMessage ?: "Update failed")
                             .setActions(retryAction)
                             .setColor(Color.RED)
                             .buildThenNotify()
                         e.printStackTrace()
-                        // Fail the work to stop infinite retries
+                        // 明确返回 Failure，停止重试
                         Result.failure()
                     }
                 }
@@ -124,7 +123,6 @@ class SubscriptionWorker @AssistedInject constructor(
                 val playlistUrl = epgPlaylistUrl ?: return@coroutineScope Result.failure()
                 val ignoreCache = epgIgnoreCache
                 try {
-                    // Using the signature found in your uploaded file
                     programmeRepository.checkOrRefreshProgrammesOrThrow(
                         playlistUrl,
                         ignoreCache = ignoreCache
@@ -191,6 +189,7 @@ class SubscriptionWorker @AssistedInject constructor(
             }
 
             else -> {
+                // do nothing
                 Result.failure()
             }
         }
