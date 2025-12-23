@@ -31,11 +31,9 @@ import javax.inject.Inject
 @AndroidEntryPoint
 class PlayerActivity : ComponentActivity() {
     private val viewModel: ChannelViewModel by viewModels()
-
     private val helper: Helper = Helper(this)
 
     companion object {
-        // FIXME: the property is worked only when activity has one instance at most.
         var isInPipMode: Boolean = false
             private set
 
@@ -44,11 +42,7 @@ class PlayerActivity : ComponentActivity() {
         fun closeExistingPip() {
             pipActivityRef?.get()?.let { activity ->
                 if (!activity.isFinishing && !activity.isDestroyed) {
-                    try {
-                        activity.finish()
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
+                    activity.finish()
                 }
             }
             pipActivityRef = null
@@ -73,12 +67,8 @@ class PlayerActivity : ComponentActivity() {
             ) {
                 val hazeState = remember { HazeState() }
                 CompositionLocalProvider(LocalHazeState provides hazeState) {
-                    Background(
-                        color = Color.Black
-                    ) {
-                        ChannelRoute(
-                            viewModel = viewModel
-                        )
+                    Background(color = Color.Black) {
+                        ChannelRoute(viewModel = viewModel)
                     }
                 }
             }
@@ -107,24 +97,27 @@ class PlayerActivity : ComponentActivity() {
             val channel = channelRepository.get(channelId) ?: return@launch
             val playlist = playlistRepository.get(channel.playlistUrl)
             when {
-                // series can not be played from shortcuts
                 playlist?.isSeries == true -> {}
-                else -> {
-                    helper.play(MediaCommand.Common(channel.id))
-                }
+                else -> helper.play(MediaCommand.Common(channel.id))
             }
         }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        
+
         if (isInPictureInPictureMode) {
+            val restartIntent = Intent(this, PlayerActivity::class.java)
+            
+            if (intent.extras != null) {
+                restartIntent.putExtras(intent.extras!!)
+            }
+            
+            restartIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK)
+            
+            startActivity(restartIntent)
+            
             finish()
-            val restartIntent = Intent(intent)
-            restartIntent.component = intent.component 
-            restartIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            applicationContext.startActivity(restartIntent)
             return
         }
 
