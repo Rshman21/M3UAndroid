@@ -1,5 +1,6 @@
 package com.m3u.smartphone.ui.business.channel
 
+import android.app.Activity
 import android.content.Intent
 import android.content.res.Configuration
 import android.os.Bundle
@@ -25,6 +26,7 @@ import com.m3u.smartphone.ui.material.model.LocalHazeState
 import dagger.hilt.android.AndroidEntryPoint
 import dev.chrisbanes.haze.HazeState
 import kotlinx.coroutines.launch
+import java.lang.ref.WeakReference
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -37,6 +39,21 @@ class PlayerActivity : ComponentActivity() {
         // FIXME: the property is worked only when activity has one instance at most.
         var isInPipMode: Boolean = false
             private set
+
+        private var pipActivityRef: WeakReference<PlayerActivity>? = null
+
+        fun closeExistingPip() {
+            pipActivityRef?.get()?.let { activity ->
+                if (!activity.isFinishing && !activity.isDestroyed) {
+                    try {
+                        activity.finish()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            }
+            pipActivityRef = null
+        }
     }
 
     @Inject
@@ -46,6 +63,8 @@ class PlayerActivity : ComponentActivity() {
     lateinit var playlistRepository: PlaylistRepository
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        closeExistingPip()
+
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         handleIntent(intent)
@@ -68,6 +87,15 @@ class PlayerActivity : ComponentActivity() {
         }
         addOnPictureInPictureModeChangedListener {
             isInPipMode = it.isInPictureInPictureMode
+            
+            if (it.isInPictureInPictureMode) {
+                pipActivityRef = WeakReference(this)
+            } else {
+                if (pipActivityRef?.get() == this) {
+                    pipActivityRef = null
+                }
+            }
+
             if (!it.isInPictureInPictureMode && lifecycle.currentState !in arrayOf(
                     Lifecycle.State.RESUMED,
                     Lifecycle.State.STARTED
@@ -94,6 +122,12 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        
+        if (isInPictureInPictureMode) {
+            finish()
+            return
+        }
+        
         handleIntent(intent)
     }
 
