@@ -60,6 +60,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.paging.compose.LazyPagingItems
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
+import androidx.compose.ui.platform.LocalConfiguration
 import coil.compose.SubcomposeAsyncImage
 import com.m3u.core.foundation.components.AbsoluteSmoothCornerShape
 import com.m3u.core.foundation.components.CircularProgressIndicator
@@ -462,9 +464,15 @@ private fun ChannelGalleryItem(
             modifier = Modifier.padding(spacing.medium)
         )
     }
+    val configuration = LocalConfiguration.current
+
     val onClick = lambda@{
         if (isPlaying) {
-            helper.screenOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            if (configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+                helper.screenOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            } else {
+                helper.screenOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            }
             return@lambda
         }
         coroutineScope.launch {
