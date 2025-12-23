@@ -97,8 +97,7 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         val newChannels = mutableListOf<Channel>()
 
         try {
-            // 【关键修复1】增加 20秒 超时保护
-            // 如果解析器因为 # 注释卡死，或者网络流不返回，20秒后自动抛异常
+            // 设置 20 秒超时，防止解析卡死
             withTimeout(20.seconds) {
                 val inputStream = when {
                     url.isSupportedNetworkUrl() -> openNetworkInput(actualUrl)
@@ -109,10 +108,9 @@ internal class PlaylistRepositoryImpl @Inject constructor(
                 inputStream.use { input ->
                     m3uParser.parse(input.buffered())
                         .collect { m3uData ->
-                            // 【关键修复2】跳过被注释的链接
+                            // 过滤逻辑：去掉空行和 # 开头的注释行
                             val cleanUrl = m3uData.url.trim()
                             if (cleanUrl.isBlank() || cleanUrl.startsWith("#")) {
-                                // 这是一个被注释掉的链接（例如 #https://...），直接跳过
                                 return@collect
                             }
                             newChannels.add(m3uData.toChannel(actualUrl))
@@ -120,21 +118,19 @@ internal class PlaylistRepositoryImpl @Inject constructor(
                 }
             }
         } catch (e: Exception) {
-            logger.log("Parse failed or timed out: ${e.message}")
+            logger.log("Parse failed: ${e.message}")
             throw e
         } catch (e: Throwable) {
-            // 捕获严重错误 (OutOfMemory, StackOverflow)
+            // 捕获严重错误
             logger.log("Critical parser error: ${e.message}")
             throw RuntimeException("Critical error: ${e.message}", e)
         }
 
         if (newChannels.isEmpty()) {
-            throw RuntimeException("No valid channels found. Check if file is valid.")
+            throw RuntimeException("No valid channels found.")
         }
 
-        // 3. 写入数据库 (保持原有逻辑)
         val playlistStrategy = settings[PreferencesKeys.PLAYLIST_STRATEGY]
-        
         val playlist = playlistDao.get(actualUrl)?.copy(
             title = title,
             source = DataSource.M3U
@@ -169,10 +165,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         }
     }
 
-    // xtreamOrThrow 和其他方法保持不变，为节省篇幅，请保留你之前文件中已有的实现
-    // ... (复制你原来的 xtreamOrThrow, insertEpgAsPlaylist, refresh 等方法) ...
-    
-    // START: 必须保留的辅助方法
     override suspend fun xtreamOrThrow(
         title: String,
         basicUrl: String,
@@ -225,7 +217,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         }
     }
     
-    // 务必保留 openNetworkInput 的实现
     private fun openNetworkInput(url: String): InputStream? {
         val request = Request.Builder().url(url).build()
         val response = okHttpClient.newCall(request).execute()

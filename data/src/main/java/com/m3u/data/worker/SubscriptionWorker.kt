@@ -104,12 +104,12 @@ class SubscriptionWorker @AssistedInject constructor(
                 
                 DataSource.EPG -> {
                     val playlistUrl = epgPlaylistUrl ?: return@coroutineScope Result.failure()
-                    // 【修复】根据报错信息，这里需要传递 (String, String, Boolean)
-                    // 参数1: playlistUrl, 参数2: epgUrl (这里也是 playlistUrl), 参数3: ignoreCache
+                    // 【修复编译错误】使用位置参数，避免参数名错误
+                    // 顺序推测为：(playlistUrl: String, epgUrl: String, ignoreCache: Boolean)
                     programmeRepository.checkOrRefreshProgrammesOrThrow(
-                        playlistUrl = playlistUrl,
-                        epgUrl = playlistUrl, 
-                        ignoreCache = epgIgnoreCache
+                        playlistUrl, 
+                        playlistUrl, 
+                        epgIgnoreCache
                     )
                         .onEach { count ->
                             val notification = createN10nBuilder()
@@ -125,7 +125,6 @@ class SubscriptionWorker @AssistedInject constructor(
 
                 DataSource.Xtream -> {
                     title ?: return@coroutineScope Result.failure()
-                    // 确保 basicUrl 不为空，虽然上面已有检查，但这里用 Elvis 这里的检查更安全
                     val basicUrlSafe = basicUrl ?: return@coroutineScope Result.failure()
                     val usernameSafe = username ?: return@coroutineScope Result.failure()
                     val passwordSafe = password ?: return@coroutineScope Result.failure()
@@ -159,6 +158,7 @@ class SubscriptionWorker @AssistedInject constructor(
                 else -> Result.failure()
             }
         } catch (e: Throwable) {
+            // 捕获所有错误（包括内存溢出、死循环导致的栈溢出等）
             e.printStackTrace()
             notifyError(e.message ?: "Unknown error")
             Result.failure()
