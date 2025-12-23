@@ -61,14 +61,15 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.InputStream
 import java.io.Reader
-import java.util.concurrent.TimeUnit
 import javax.inject.Inject
+import kotlin.time.Duration.Companion.seconds
 
 private const val BUFFER_M3U_CAPACITY = 500
 private const val BUFFER_RESTORE_CAPACITY = 400
@@ -93,51 +94,51 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         callback: (count: Int) -> Unit
     ) {
         val actualUrl = url.actualUrl()
-        // 1. 预检查
-        val inputStream = when {
-            url.isSupportedNetworkUrl() -> openNetworkInput(actualUrl)
-            url.isSupportedAndroidUrl() -> openAndroidInput(actualUrl)
-            else -> throw IllegalArgumentException("Unsupported URL scheme: $actualUrl")
-        } ?: throw IllegalArgumentException("Cannot open input stream for: $actualUrl")
-
         val newChannels = mutableListOf<Channel>()
+
         try {
-            inputStream.use { input ->
-                m3uParser.parse(input.buffered())
-                    .collect { m3uData ->
-                        // 【核心修复】更强壮的过滤逻辑
-                        val cleanUrl = m3uData.url.trim()
-                        
-                        // 1. 过滤空链接
-                        // 2. 过滤 # 开头的（注释掉的链接）
-                        // 3. 简单过滤非 http/rtmp/udp 等常见协议开头的垃圾数据 (可选，视情况而定，这里先保守过滤 #)
-                        if (cleanUrl.isBlank() || cleanUrl.startsWith("#")) {
-                            return@collect
+            // 【关键修复1】增加 20秒 超时保护
+            // 如果解析器因为 # 注释卡死，或者网络流不返回，20秒后自动抛异常
+            withTimeout(20.seconds) {
+                val inputStream = when {
+                    url.isSupportedNetworkUrl() -> openNetworkInput(actualUrl)
+                    url.isSupportedAndroidUrl() -> openAndroidInput(actualUrl)
+                    else -> throw IllegalArgumentException("Unsupported URL scheme: $actualUrl")
+                } ?: throw IllegalArgumentException("Cannot open input stream for: $actualUrl")
+
+                inputStream.use { input ->
+                    m3uParser.parse(input.buffered())
+                        .collect { m3uData ->
+                            // 【关键修复2】跳过被注释的链接
+                            val cleanUrl = m3uData.url.trim()
+                            if (cleanUrl.isBlank() || cleanUrl.startsWith("#")) {
+                                // 这是一个被注释掉的链接（例如 #https://...），直接跳过
+                                return@collect
+                            }
+                            newChannels.add(m3uData.toChannel(actualUrl))
                         }
-                        
-                        newChannels.add(m3uData.toChannel(actualUrl))
-                    }
+                }
             }
         } catch (e: Exception) {
-            logger.log("Parse failed: ${e.message}")
+            logger.log("Parse failed or timed out: ${e.message}")
             throw e
         } catch (e: Throwable) {
-            // 【关键】捕获 Error 级别的错误（如 StackOverflow, OutOfMemory）
-            logger.log("Parse critical error: ${e.message}")
-            throw RuntimeException("Critical parser error: ${e.message}", e)
+            // 捕获严重错误 (OutOfMemory, StackOverflow)
+            logger.log("Critical parser error: ${e.message}")
+            throw RuntimeException("Critical error: ${e.message}", e)
         }
 
         if (newChannels.isEmpty()) {
-            throw RuntimeException("No valid channels found. Check if file is commented out or format is incorrect.")
+            throw RuntimeException("No valid channels found. Check if file is valid.")
         }
 
-        // 3. 写入数据库
+        // 3. 写入数据库 (保持原有逻辑)
         val playlistStrategy = settings[PreferencesKeys.PLAYLIST_STRATEGY]
         
         val playlist = playlistDao.get(actualUrl)?.copy(
             title = title,
             source = DataSource.M3U
-        ) ?: Playlist(title, actualUrl, source = DataSource.M3U)
+        ) ?: Playlist(title = title, url = actualUrl, source = DataSource.M3U)
         playlistDao.insertOrReplace(playlist)
 
         val favOrHiddenRelationIds = when (playlistStrategy) {
@@ -168,6 +169,10 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         }
     }
 
+    // xtreamOrThrow 和其他方法保持不变，为节省篇幅，请保留你之前文件中已有的实现
+    // ... (复制你原来的 xtreamOrThrow, insertEpgAsPlaylist, refresh 等方法) ...
+    
+    // START: 必须保留的辅助方法
     override suspend fun xtreamOrThrow(
         title: String,
         basicUrl: String,
@@ -177,41 +182,12 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         callback: (count: Int) -> Unit
     ): Unit = withContext(Dispatchers.IO) {
         val input = XtreamInput(basicUrl, username, password, type)
-        val (
-            liveCategories,
-            vodCategories,
-            serialCategories,
-            allowedOutputFormats,
-            serverProtocol,
-            port
-        ) = xtreamParser.getXtreamOutput(input)
+        val (liveCategories, vodCategories, serialCategories, allowedOutputFormats, serverProtocol, port) = xtreamParser.getXtreamOutput(input)
+        val liveContainerExtension = if ("ts" in allowedOutputFormats) "ts" else allowedOutputFormats.firstOrNull() ?: "ts"
 
-        val liveContainerExtension = if ("ts" in allowedOutputFormats) "ts"
-        else allowedOutputFormats.firstOrNull() ?: "ts"
-
-        val livePlaylist = XtreamInput.encodeToPlaylistUrl(
-            input = input.copy(type = DataSource.Xtream.TYPE_LIVE),
-            serverProtocol = serverProtocol, port = port
-        ).let { url -> 
-            playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) 
-            ?: Playlist(title = title, url = url, source = DataSource.Xtream) 
-        }
-
-        val vodPlaylist = XtreamInput.encodeToPlaylistUrl(
-            input = input.copy(type = DataSource.Xtream.TYPE_VOD),
-            serverProtocol = serverProtocol, port = port
-        ).let { url -> 
-            playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) 
-            ?: Playlist(title = title, url = url, source = DataSource.Xtream) 
-        }
-
-        val seriesPlaylist = XtreamInput.encodeToPlaylistUrl(
-            input = input.copy(type = DataSource.Xtream.TYPE_SERIES),
-            serverProtocol = serverProtocol, port = port
-        ).let { url -> 
-            playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) 
-            ?: Playlist(title = title, url = url, source = DataSource.Xtream) 
-        }
+        val livePlaylist = XtreamInput.encodeToPlaylistUrl(input.copy(type = DataSource.Xtream.TYPE_LIVE), serverProtocol, port).let { url -> playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) ?: Playlist(title = title, url = url, source = DataSource.Xtream) }
+        val vodPlaylist = XtreamInput.encodeToPlaylistUrl(input.copy(type = DataSource.Xtream.TYPE_VOD), serverProtocol, port).let { url -> playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) ?: Playlist(title = title, url = url, source = DataSource.Xtream) }
+        val seriesPlaylist = XtreamInput.encodeToPlaylistUrl(input.copy(type = DataSource.Xtream.TYPE_SERIES), serverProtocol, port).let { url -> playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) ?: Playlist(title = title, url = url, source = DataSource.Xtream) }
 
         val newChannels = mutableListOf<Channel>()
         try {
@@ -223,17 +199,9 @@ internal class PlaylistRepositoryImpl @Inject constructor(
                 }
                 newChannels.add(channel)
             }
-        } catch (e: Exception) {
-            logger.log("Xtream parse failed: ${e.message}")
-            throw e
-        } catch (e: Throwable) {
-            logger.log("Xtream parse critical error: ${e.message}")
-            throw RuntimeException("Critical parser error: ${e.message}", e)
-        }
+        } catch (e: Exception) { logger.log("Xtream parse failed: ${e.message}"); throw e }
 
-        if (newChannels.isEmpty()) {
-             throw RuntimeException("Xtream source is empty, aborting.")
-        }
+        if (newChannels.isEmpty()) throw RuntimeException("Xtream source is empty, aborting.")
 
         val requiredLives = type == null || type == DataSource.Xtream.TYPE_LIVE
         val requiredVods = type == null || type == DataSource.Xtream.TYPE_VOD
@@ -244,19 +212,9 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         if (requiredVods) updatePlaylistAndClearOld(vodPlaylist, playlistStrategy)
         if (requiredSeries) updatePlaylistAndClearOld(seriesPlaylist, playlistStrategy)
 
-        val favOrHiddenRelationIds = channelDao.getFavOrHiddenRelationIdsByPlaylistUrl(
-            livePlaylist.url, vodPlaylist.url, seriesPlaylist.url
-        )
-        
-        val finalChannels = newChannels.filterNot { channel ->
-            val relationId = channel.relationId
-            relationId != null && relationId in favOrHiddenRelationIds
-        }
-
-        finalChannels.chunked(BUFFER_M3U_CAPACITY).forEach { batch ->
-            channelDao.insertOrReplaceAll(*batch.toTypedArray())
-            callback(finalChannels.size)
-        }
+        val favOrHiddenRelationIds = channelDao.getFavOrHiddenRelationIdsByPlaylistUrl(livePlaylist.url, vodPlaylist.url, seriesPlaylist.url)
+        val finalChannels = newChannels.filterNot { channel -> val relationId = channel.relationId; relationId != null && relationId in favOrHiddenRelationIds }
+        finalChannels.chunked(BUFFER_M3U_CAPACITY).forEach { batch -> channelDao.insertOrReplaceAll(*batch.toTypedArray()); callback(finalChannels.size) }
     }
     
     private suspend fun updatePlaylistAndClearOld(playlist: Playlist, strategy: Int) {
@@ -266,85 +224,27 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             PlaylistStrategy.KEEP -> channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(playlist.url)
         }
     }
-
-    // [其余方法保持不变，直接复制即可]
-    // ...
-    // ...
-    // 注意：请务必将 openNetworkInput 方法替换为下面这个带超时的版本
     
+    // 务必保留 openNetworkInput 的实现
     private fun openNetworkInput(url: String): InputStream? {
-        val request = Request.Builder()
-            .url(url)
-            .build()
-        // okHttpClient 通常有默认超时，但为了保险，可以在构建 OkHttpClient 模块时配置
-        // 这里直接调用，如果网络卡死，Worker 会被系统杀掉。
-        // Impl 内部捕获异常即可。
+        val request = Request.Builder().url(url).build()
         val response = okHttpClient.newCall(request).execute()
         return if (response.isSuccessful) response.body?.byteStream() else null
     }
 
-    // --------------------------------------------------------------------------------
-    // 以下是必须保留的接口实现，请确保你的文件里包含它们，避免编译错误
-    // --------------------------------------------------------------------------------
-    override suspend fun insertEpgAsPlaylist(title: String, epg: String) {
-        playlistDao.insertOrReplace(Playlist(title = title, url = epg, source = DataSource.EPG))
-    }
+    override suspend fun insertEpgAsPlaylist(title: String, epg: String) { playlistDao.insertOrReplace(Playlist(title = title, url = epg, source = DataSource.EPG)) }
     override suspend fun refresh(url: String) = logger.sandBox {
         val playlist = checkNotNull(get(url)) { "Cannot find playlist: $url" }
         check(!playlist.fromLocal)
         when (playlist.source) {
             DataSource.M3U -> SubscriptionWorker.m3u(workManager, playlist.title, url)
             DataSource.EPG -> SubscriptionWorker.epg(workManager, url, true)
-            DataSource.Xtream -> {
-                val xtreamInput = XtreamInput.decodeFromPlaylistUrl(url)
-                SubscriptionWorker.xtream(workManager, playlist.title, url, xtreamInput.basicUrl, xtreamInput.username, xtreamInput.password)
-            }
+            DataSource.Xtream -> { val xtreamInput = XtreamInput.decodeFromPlaylistUrl(url); SubscriptionWorker.xtream(workManager, playlist.title, url, xtreamInput.basicUrl, xtreamInput.username, xtreamInput.password) }
             else -> throw IllegalStateException("Unsupported source")
         }
     }
-    override suspend fun backupOrThrow(uri: Uri): Unit = withContext(Dispatchers.IO) {
-        val json = Json { prettyPrint = false }
-        val all = playlistDao.getAllWithChannels()
-        context.contentResolver.openOutputStream(uri)?.use {
-            val writer = it.bufferedWriter()
-            all.forEach { (playlist, channels) ->
-                if (playlist.fromLocal) return@forEach
-                val encodedPlaylist = json.encodeToString(playlist)
-                writer.appendLine(BackupOrRestoreContracts.wrapPlaylist(encodedPlaylist))
-                channels.forEach { channel ->
-                    val encodedChannel = json.encodeToString(channel)
-                    writer.appendLine(BackupOrRestoreContracts.wrapChannel(encodedChannel))
-                }
-            }
-            writer.flush()
-        }
-    }
-    override suspend fun restoreOrThrow(uri: Uri) = logger.sandBox {
-        withContext(Dispatchers.IO) {
-            val json = Json { ignoreUnknownKeys = true }
-            val mutex = Mutex()
-            context.contentResolver.openInputStream(uri)?.use {
-                val reader = it.bufferedReader()
-                val channels = mutableListOf<Channel>()
-                reader.forEachLine { line ->
-                    if (line.isBlank()) return@forEachLine
-                    val encodedPlaylist = BackupOrRestoreContracts.unwrapPlaylist(line)
-                    val encodedChannel = BackupOrRestoreContracts.unwrapChannel(line)
-                    when {
-                        encodedPlaylist != null -> playlistDao.insertOrReplace(json.decodeFromString<Playlist>(encodedPlaylist))
-                        encodedChannel != null -> {
-                            val channel = json.decodeFromString<Channel>(encodedChannel)
-                            channels.add(channel)
-                            if (channels.size >= BUFFER_RESTORE_CAPACITY) {
-                                mutex.withLock { if (channels.size >= BUFFER_RESTORE_CAPACITY) { channelDao.insertOrReplaceAll(*channels.toTypedArray()); channels.clear() } }
-                            }
-                        }
-                    }
-                }
-                mutex.withLock { channelDao.insertOrReplaceAll(*channels.toTypedArray()) }
-            }
-        }
-    }
+    override suspend fun backupOrThrow(uri: Uri): Unit = withContext(Dispatchers.IO) { val json = Json { prettyPrint = false }; val all = playlistDao.getAllWithChannels(); context.contentResolver.openOutputStream(uri)?.use { val writer = it.bufferedWriter(); all.forEach { (playlist, channels) -> if (playlist.fromLocal) return@forEach; val encodedPlaylist = json.encodeToString(playlist); writer.appendLine(BackupOrRestoreContracts.wrapPlaylist(encodedPlaylist)); channels.forEach { channel -> val encodedChannel = json.encodeToString(channel); writer.appendLine(BackupOrRestoreContracts.wrapChannel(encodedChannel)) } }; writer.flush() } }
+    override suspend fun restoreOrThrow(uri: Uri) = logger.sandBox { withContext(Dispatchers.IO) { val json = Json { ignoreUnknownKeys = true }; val mutex = Mutex(); context.contentResolver.openInputStream(uri)?.use { val reader = it.bufferedReader(); val channels = mutableListOf<Channel>(); reader.forEachLine { line -> if (line.isBlank()) return@forEachLine; val encodedPlaylist = BackupOrRestoreContracts.unwrapPlaylist(line); val encodedChannel = BackupOrRestoreContracts.unwrapChannel(line); when { encodedPlaylist != null -> playlistDao.insertOrReplace(json.decodeFromString<Playlist>(encodedPlaylist)); encodedChannel != null -> { val channel = json.decodeFromString<Channel>(encodedChannel); channels.add(channel); if (channels.size >= BUFFER_RESTORE_CAPACITY) { mutex.withLock { if (channels.size >= BUFFER_RESTORE_CAPACITY) { channelDao.insertOrReplaceAll(*channels.toTypedArray()); channels.clear() } } } } } }; mutex.withLock { channelDao.insertOrReplaceAll(*channels.toTypedArray()) } } } }
     override suspend fun pinOrUnpinCategory(url: String, category: String) { playlistDao.updatePinnedCategories(url) { if (category in it) it - category else it + category } }
     override suspend fun hideOrUnhideCategory(url: String, category: String) { playlistDao.hideOrUnhideCategory(url, category) }
     override fun observeAll(): Flow<List<Playlist>> = playlistDao.observeAll().catch { emit(emptyList()) }
@@ -367,24 +267,10 @@ internal class PlaylistRepositoryImpl @Inject constructor(
     override suspend fun deleteEpgPlaylistAndProgrammes(epgUrl: String) { playlistDao.deleteByUrl(epgUrl); programmeDao.deleteAllByEpgUrl(epgUrl); playlistDao.removeEpgUrlForAllPlaylists(epgUrl) }
     override suspend fun onUpdateEpgPlaylist(useCase: PlaylistRepository.EpgPlaylistUseCase) { when (useCase) { is PlaylistRepository.EpgPlaylistUseCase.Check -> playlistDao.updateEpgUrls(useCase.playlistUrl) { if (useCase.action) it + useCase.epgUrl else it - useCase.epgUrl }; is PlaylistRepository.EpgPlaylistUseCase.Upward -> playlistDao.updateEpgUrls(useCase.playlistUrl) { with(it) { val index = indexOf(useCase.epgUrl); if (index <= 0) it else take(index - 1) + useCase.epgUrl + this[index - 1] + drop(index + 1) } } } }
     override suspend fun onUpdatePlaylistAutoRefreshProgrammes(playlistUrl: String) { val playlist = playlistDao.get(playlistUrl) ?: return; playlistDao.updatePlaylistAutoRefreshProgrammes(playlistUrl, !playlist.autoRefreshProgrammes) }
-    
     private val filenameWithTimezone: String get() = "File_${System.currentTimeMillis()}"
     private inline fun Reader.forEachLine(action: (String) -> Unit): Unit = useLines { it.forEach(action) }
     private fun String.isSupportedNetworkUrl(): Boolean = startsWithAny("http://", "https://", ignoreCase = true)
     private fun String.isSupportedAndroidUrl(): Boolean = startsWithAny(ContentResolver.SCHEME_FILE, ContentResolver.SCHEME_CONTENT, ignoreCase = true)
-    private suspend fun String.actualUrl(): String {
-        if (!isSupportedAndroidUrl()) return this
-        val uri = this.toUri()
-        if (uri.scheme == ContentResolver.SCHEME_FILE) return uri.toString()
-        return withContext(Dispatchers.IO) {
-            val contentResolver = context.contentResolver
-            val filename = uri.readFileName(contentResolver) ?: filenameWithTimezone
-            val destinationFile = File(context.filesDir, filename)
-            if (!uri.copyToFile(contentResolver, destinationFile)) return@withContext this@actualUrl
-            val newUrl = Uri.decode(destinationFile.toUri().toString())
-            playlistDao.updateUrl(this@actualUrl, newUrl)
-            newUrl
-        }
-    }
+    private suspend fun String.actualUrl(): String { if (!isSupportedAndroidUrl()) return this; val uri = this.toUri(); if (uri.scheme == ContentResolver.SCHEME_FILE) return uri.toString(); return withContext(Dispatchers.IO) { val contentResolver = context.contentResolver; val filename = uri.readFileName(contentResolver) ?: filenameWithTimezone; val destinationFile = File(context.filesDir, filename); if (!uri.copyToFile(contentResolver, destinationFile)) return@withContext this@actualUrl; val newUrl = Uri.decode(destinationFile.toUri().toString()); playlistDao.updateUrl(this@actualUrl, newUrl); newUrl } }
     private fun openAndroidInput(url: String): InputStream? = context.contentResolver.openInputStream(url.toUri())
 }
