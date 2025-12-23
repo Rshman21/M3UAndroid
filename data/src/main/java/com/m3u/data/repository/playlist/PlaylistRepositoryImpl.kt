@@ -41,6 +41,7 @@ import com.m3u.data.parser.xtream.XtreamVod
 import com.m3u.data.parser.xtream.asChannel
 import com.m3u.data.parser.xtream.toChannel
 import com.m3u.data.repository.BackupOrRestoreContracts
+import com.m3u.data.repository.createCoroutineCache
 import com.m3u.data.worker.SubscriptionWorker
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.ktor.http.Url
@@ -54,6 +55,9 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -88,47 +92,40 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         callback: (count: Int) -> Unit
     ) {
         val actualUrl = url.actualUrl()
-        // 1. 预检查：尝试连接或准备文件，如果这步失败，直接抛出异常，数据库不会被触碰
+        // 1. 预检查：尝试连接或准备文件
         val inputStream = when {
             url.isSupportedNetworkUrl() -> openNetworkInput(actualUrl)
             url.isSupportedAndroidUrl() -> openAndroidInput(actualUrl)
             else -> throw IllegalArgumentException("Unsupported URL scheme: $actualUrl")
         } ?: throw IllegalArgumentException("Cannot open input stream for: $actualUrl")
 
-        // 2. 解析：将数据先解析到内存列表中，而不是直接写入数据库
-        // 这样如果解析中途失败，或者文件为空，我们可以中止操作，保留旧数据
+        // 2. 解析：将数据先解析到内存列表中
         val newChannels = mutableListOf<Channel>()
         try {
             inputStream.use { input ->
                 m3uParser.parse(input.buffered())
                     .collect { m3uData ->
                         newChannels.add(m3uData.toChannel(actualUrl))
-                        // 可选：在这里回调进度，但此时还没有真正写入
-                        // callback(newChannels.size) 
                     }
             }
         } catch (e: Exception) {
             logger.log("Parse failed, aborting update: ${e.message}")
-            throw e // 抛出异常，Worker 会捕获并通知失败，旧数据保留
+            throw e
         }
 
         if (newChannels.isEmpty()) {
-            // 如果列表为空，根据策略决定是清空还是报错
-            // 这里我们选择抛错，防止配置写错导致清空列表
             throw RuntimeException("Stream list is empty, aborting update.")
         }
 
         // 3. 写入：数据准备完毕，现在开始安全的数据库事务操作
         val playlistStrategy = settings[PreferencesKeys.PLAYLIST_STRATEGY]
         
-        // 更新 Playlist 元数据
         val playlist = playlistDao.get(actualUrl)?.copy(
             title = title,
             source = DataSource.M3U
         ) ?: Playlist(title, actualUrl, source = DataSource.M3U)
         playlistDao.insertOrReplace(playlist)
 
-        // 策略判断：是否保留收藏/隐藏
         val favOrHiddenRelationIds = when (playlistStrategy) {
             PlaylistStrategy.ALL -> emptyList()
             else -> channelDao.getFavOrHiddenRelationIdsByPlaylistUrl(url)
@@ -138,13 +135,11 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             else -> channelDao.getFavOrHiddenUrlsByPlaylistUrlNotContainsRelationId(url)
         }
 
-        // 执行清理旧数据
         when (playlistStrategy) {
             PlaylistStrategy.ALL -> channelDao.deleteByPlaylistUrl(url)
             PlaylistStrategy.KEEP -> channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(url)
         }
 
-        // 过滤并插入新数据
         val finalChannels = newChannels.filterNot { channel ->
             val relationId = channel.relationId
             when {
@@ -153,10 +148,9 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             }
         }
 
-        // 批量插入 (使用 chunks 防止事务过大，尽管 Room 可以处理)
         finalChannels.chunked(BUFFER_M3U_CAPACITY).forEach { batch ->
             channelDao.insertOrReplaceAll(*batch.toTypedArray())
-            callback(finalChannels.size) // 这里回调才是真正的入库进度
+            callback(finalChannels.size)
         }
     }
 
@@ -168,7 +162,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         type: String?,
         callback: (count: Int) -> Unit
     ): Unit = withContext(Dispatchers.IO) {
-        // 1. 预检查与数据获取：先从网络获取所有数据存入内存
         val input = XtreamInput(basicUrl, username, password, type)
         val (
             liveCategories,
@@ -177,28 +170,36 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             allowedOutputFormats,
             serverProtocol,
             port
-        ) = xtreamParser.getXtreamOutput(input) // 这一步网络请求如果失败，直接抛异常，不删数据
+        ) = xtreamParser.getXtreamOutput(input)
 
         val liveContainerExtension = if ("ts" in allowedOutputFormats) "ts"
         else allowedOutputFormats.firstOrNull() ?: "ts"
 
-        // 构建 Playlist 对象
+        // 【关键修改】这里使用具名参数 source = DataSource.Xtream，解决了编译报错
         val livePlaylist = XtreamInput.encodeToPlaylistUrl(
             input = input.copy(type = DataSource.Xtream.TYPE_LIVE),
             serverProtocol = serverProtocol, port = port
-        ).let { url -> playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) ?: Playlist(title, url, DataSource.Xtream) }
+        ).let { url -> 
+            playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) 
+            ?: Playlist(title = title, url = url, source = DataSource.Xtream) 
+        }
 
         val vodPlaylist = XtreamInput.encodeToPlaylistUrl(
             input = input.copy(type = DataSource.Xtream.TYPE_VOD),
             serverProtocol = serverProtocol, port = port
-        ).let { url -> playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) ?: Playlist(title, url, DataSource.Xtream) }
+        ).let { url -> 
+            playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) 
+            ?: Playlist(title = title, url = url, source = DataSource.Xtream) 
+        }
 
         val seriesPlaylist = XtreamInput.encodeToPlaylistUrl(
             input = input.copy(type = DataSource.Xtream.TYPE_SERIES),
             serverProtocol = serverProtocol, port = port
-        ).let { url -> playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) ?: Playlist(title, url, DataSource.Xtream) }
+        ).let { url -> 
+            playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) 
+            ?: Playlist(title = title, url = url, source = DataSource.Xtream) 
+        }
 
-        // 2. 解析所有流信息到内存 List
         val newChannels = mutableListOf<Channel>()
         try {
             xtreamParser.parse(input).collect { current ->
@@ -218,18 +219,15 @@ internal class PlaylistRepositoryImpl @Inject constructor(
              throw RuntimeException("Xtream source is empty, aborting.")
         }
 
-        // 3. 写入数据库
         val requiredLives = type == null || type == DataSource.Xtream.TYPE_LIVE
         val requiredVods = type == null || type == DataSource.Xtream.TYPE_VOD
         val requiredSeries = type == null || type == DataSource.Xtream.TYPE_SERIES
         val playlistStrategy = settings[PreferencesKeys.PLAYLIST_STRATEGY]
 
-        // 插入 Playlist 信息并清理旧数据
         if (requiredLives) updatePlaylistAndClearOld(livePlaylist, playlistStrategy)
         if (requiredVods) updatePlaylistAndClearOld(vodPlaylist, playlistStrategy)
         if (requiredSeries) updatePlaylistAndClearOld(seriesPlaylist, playlistStrategy)
 
-        // 过滤隐藏/收藏逻辑
         val favOrHiddenRelationIds = channelDao.getFavOrHiddenRelationIdsByPlaylistUrl(
             livePlaylist.url, vodPlaylist.url, seriesPlaylist.url
         )
@@ -239,14 +237,12 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             relationId != null && relationId in favOrHiddenRelationIds
         }
 
-        // 批量插入
         finalChannels.chunked(BUFFER_M3U_CAPACITY).forEach { batch ->
             channelDao.insertOrReplaceAll(*batch.toTypedArray())
             callback(finalChannels.size)
         }
     }
     
-    // 辅助方法：更新 Playlist 并根据策略清理旧 Channel
     private suspend fun updatePlaylistAndClearOld(playlist: Playlist, strategy: Int) {
         playlistDao.insertOrReplace(playlist)
         when (strategy) {
@@ -287,10 +283,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         }
     }
 
-    // ... (Backup/Restore/Others 保持不变，可以直接复制你原来的代码，这里省略以节省篇幅，重点是 m3uOrThrow 和 xtreamOrThrow)
-    // 必须保留 backupOrThrow, restoreOrThrow, observeAll 等方法的实现
-    
-    // START: 以下为保持不变的辅助代码，请确保补全
     override suspend fun backupOrThrow(uri: Uri): Unit = withContext(Dispatchers.IO) {
         val json = Json { prettyPrint = false }
         val all = playlistDao.getAllWithChannels()
@@ -413,7 +405,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
     }
     private fun openNetworkInput(url: String): InputStream? {
         val request = Request.Builder().url(url).build()
-        // 这里 execute 可能会抛出 IO 异常，Impl 里已经捕获了
         val response = okHttpClient.newCall(request).execute()
         return if (response.isSuccessful) response.body?.byteStream() else null
     }

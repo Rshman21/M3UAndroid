@@ -67,7 +67,6 @@ class SubscriptionWorker @AssistedInject constructor(
         dataSource ?: return@coroutineScope Result.failure()
         createChannel()
         
-        // 确保协程取消时通知也被取消
         coroutineContext[Job]?.invokeOnCompletion { cause ->
             if (cause is CancellationException) {
                 notificationManager.cancel(notificationId)
@@ -84,7 +83,6 @@ class SubscriptionWorker @AssistedInject constructor(
                         Result.failure()
                     } else {
                         var total = 0
-                        // 现在 Repository 会在内部校验，如果网络失败会直接抛异常，不会清空数据
                         playlistRepository.m3uOrThrow(title, url) { count ->
                             total = count
                             val notification = createN10nBuilder()
@@ -95,7 +93,6 @@ class SubscriptionWorker @AssistedInject constructor(
                             notificationManager.notify(notificationId, notification)
                         }
 
-                        // 成功完成
                         createN10nBuilder()
                             .setContentText(findCompleteContentText(total))
                             .setOngoing(false)
@@ -160,20 +157,17 @@ class SubscriptionWorker @AssistedInject constructor(
             }
         } catch (e: Exception) {
             e.printStackTrace()
-            // 捕获所有异常（网络、解析等），显示错误通知
             notifyError(e.localizedMessage.orEmpty())
-            // 返回 Failure，不再重试，防止死循环
             Result.failure()
         }
     }
 
-    // 辅助方法：发送错误通知
     private fun notifyError(message: String) {
         val notification = createN10nBuilder()
-            .setContentTitle("Update Failed") // 或者使用资源文件 string.data_error_update_failed
+            .setContentTitle("Update Failed") 
             .setContentText(message)
-            .setSmallIcon(R.drawable.round_error_outline_24) // 确保有一个错误图标
-            .setColor(Color.RED)
+            // 【关键修改】使用存在的图标，并移除了 setColor 以避免编译问题
+            .setSmallIcon(R.drawable.round_cancel_24) 
             .setOngoing(false)
             .setAutoCancel(true)
             .build()
@@ -234,13 +228,9 @@ class SubscriptionWorker @AssistedInject constructor(
             .build()
     }
     
-    // Retry action 被我移除了，因为你不想在失败时让用户点重试然后又无限失败
-    // 如果需要保留，可以在 notifyError 里加回去
-
     companion object {
         private const val CHANNEL_ID = "subscribe_channel"
         private const val NOTIFICATION_NAME = "subscribe task"
-        // ... (其他常量保持不变)
         private const val INPUT_STRING_TITLE = "title"
         private const val INPUT_STRING_URL = "url"
         private const val INPUT_STRING_EPG_PLAYLIST_URL = "epg"
@@ -250,9 +240,6 @@ class SubscriptionWorker @AssistedInject constructor(
         private const val INPUT_STRING_PASSWORD = "password"
         private const val INPUT_STRING_DATA_SOURCE_VALUE = "data-source"
         const val TAG = "subscription"
-        
-        // ... (m3u, epg, xtream 的 companion object 方法保持不变)
-        // 仅需确保 import 正确，代码逻辑不需要变
         
         fun m3u(workManager: WorkManager, title: String, url: String) {
              workManager.cancelAllWorkByTag(url)
