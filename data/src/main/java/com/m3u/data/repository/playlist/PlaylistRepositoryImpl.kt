@@ -5,6 +5,11 @@ import android.content.Context
 import android.net.Uri
 import androidx.core.net.toUri
 import androidx.work.WorkManager
+import com.m3u.core.architecture.logger.Logger
+import com.m3u.core.architecture.logger.Profiles
+import com.m3u.core.architecture.logger.install
+import com.m3u.core.architecture.logger.post
+import com.m3u.core.architecture.logger.sandBox
 import com.m3u.core.architecture.preferences.PlaylistStrategy
 import com.m3u.core.architecture.preferences.PreferencesKeys
 import com.m3u.core.architecture.preferences.Settings
@@ -20,7 +25,7 @@ import com.m3u.data.database.model.Channel
 import com.m3u.data.database.model.DataSource
 import com.m3u.data.database.model.Playlist
 import com.m3u.data.database.model.PlaylistWithChannels
-import com.m3u.data.database.model.refreshable
+import com.m3u.data.database.model.fromLocal
 import com.m3u.data.database.model.toMap
 import com.m3u.data.parser.m3u.M3UData
 import com.m3u.data.parser.m3u.M3UParser
@@ -58,7 +63,6 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import timber.log.Timber
 import java.io.File
 import java.io.InputStream
 import java.io.Reader
@@ -78,26 +82,26 @@ internal class PlaylistRepositoryImpl @Inject constructor(
     private val xtreamParser: XtreamParser,
     private val workManager: WorkManager,
     @ApplicationContext private val context: Context,
-    private val settings: Settings
+    private val settings: Settings,
+    delegate: Logger // Added Logger delegate
 ) : PlaylistRepository {
-    private val timber = Timber.tag("PlaylistRepositoryImpl")
+    // Replaced Timber with Logger
+    private val logger = delegate.install(Profiles.REPOS_PLAYLIST)
 
     override suspend fun m3uOrThrow(
         title: String,
         url: String,
         callback: (count: Int) -> Unit
     ) {
-        // 1. 准备阶段
+        // 1. Preparation
         val internalUrl = url.copyToInternalDirPath()
-        timber.d("m3uOrThrow: url=$url, internalUrl=$internalUrl")
-        
-        // 准备一个列表暂存所有解析成功的 Channel
+        logger.post { "m3uOrThrow: url=$url, internalUrl=$internalUrl" }
+
         val validChannels = mutableListOf<Channel>()
-        
-        // 2. 解析与校验阶段 (不操作数据库删除)
-        // 使用 try-catch-finally 确保流关闭，并捕获解析错误
+
+        // 2. Parsing (with timeout and error handling)
         try {
-            // 设定 20秒 超时，防止解析死循环或网络卡死
+            // 20-second timeout to prevent hanging
             withTimeout(20.seconds) {
                 val inputStream = when {
                     url.isSupportedNetworkUrl() -> openNetworkInput(internalUrl)
@@ -108,34 +112,26 @@ internal class PlaylistRepositoryImpl @Inject constructor(
                 inputStream.use { input ->
                     m3uParser.parse(input.buffered())
                         .collect { m3uData ->
-                            // 【核心需求】过滤逻辑：
-                            // 1. 去除首尾空格
-                            // 2. 如果 URL 是空的，或者以 # 开头（注释），直接跳过
+                            // FILTER: Skip empty lines or # comments
                             val cleanUrl = m3uData.url.trim()
                             if (cleanUrl.isBlank() || cleanUrl.startsWith("#")) {
-                                return@collect // 跳过这条，继续下一条
+                                return@collect
                             }
-
-                            // 转换为 Channel 对象并存入内存列表
                             validChannels.add(m3uData.toChannel(internalUrl))
-                            
-                            // 更新进度 (仅作为解析进度的展示)
                             callback(validChannels.size)
                         }
                 }
             }
         } catch (e: Exception) {
-            // 如果在下载或解析过程中出错，直接抛出异常
-            // 此时数据库没有任何变动，旧数据得以保留
-            timber.e(e, "M3U parse failed")
-            throw e 
+            logger.post { "M3U parse failed: ${e.message}" }
+            throw e // Throw to worker to handle notification
         }
 
         if (validChannels.isEmpty()) {
-            throw RuntimeException("No valid channels found (check if all links are commented out).")
+            throw RuntimeException("No valid channels found (all links might be commented out).")
         }
 
-        // 3. 数据库写入阶段 (只有解析成功才会执行到这里)
+        // 3. Database Update (Transaction)
         val playlistStrategy = settings[PreferencesKeys.PLAYLIST_STRATEGY]
         val favOrHiddenRelationIds = when (playlistStrategy) {
             PlaylistStrategy.ALL -> emptyList()
@@ -146,20 +142,20 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             else -> channelDao.getFavOrHiddenUrlsByPlaylistUrlNotContainsRelationId(url)
         }
 
-        // 先清理旧数据
+        // Clear old data
         when (playlistStrategy) {
             PlaylistStrategy.ALL -> channelDao.deleteByPlaylistUrl(url)
             PlaylistStrategy.KEEP -> channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(url)
         }
 
-        // 更新 Playlist 信息
+        // Insert Playlist
         val playlist = playlistDao.get(internalUrl)?.copy(
             title = title,
             source = DataSource.M3U
         ) ?: Playlist(title, internalUrl, source = DataSource.M3U)
         playlistDao.insertOrReplace(playlist)
 
-        // 过滤需要保留的收藏/隐藏状态
+        // Filter and Insert Channels
         val finalChannels = validChannels.filterNot { channel ->
             val relationId = channel.relationId
             when {
@@ -168,8 +164,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             }
         }
 
-        // 批量插入新数据
-        // 使用 chunked 防止一次插入过多导致事务过大（虽然 Room 可以处理，但分批更稳妥）
         finalChannels.chunked(BUFFER_M3U_CAPACITY).forEach { batch ->
             channelDao.insertOrReplaceAll(*batch.toTypedArray())
         }
@@ -193,7 +187,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             port
         ) = xtreamParser.getXtreamOutput(input)
 
-        // we like ts but not m3u8.
         val liveContainerExtension = if ("ts" in allowedOutputFormats) "ts"
         else allowedOutputFormats.firstOrNull() ?: "ts"
 
@@ -204,14 +197,8 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         ).let { url ->
             playlistDao.get(url)
                 ?.takeIf { it.source == DataSource.Xtream }
-                ?.copy(
-                    title = title
-                )
-                ?: Playlist(
-                    title = title,
-                    url = url,
-                    source = DataSource.Xtream
-                )
+                ?.copy(title = title)
+                ?: Playlist(title = title, url = url, source = DataSource.Xtream)
         }
         val vodPlaylist = XtreamInput.encodeToPlaylistUrl(
             input = input.copy(type = DataSource.Xtream.TYPE_VOD),
@@ -220,14 +207,8 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         ).let { url ->
             playlistDao.get(url)
                 ?.takeIf { it.source == DataSource.Xtream }
-                ?.copy(
-                    title = title
-                )
-                ?: Playlist(
-                    title = title,
-                    url = url,
-                    source = DataSource.Xtream
-                )
+                ?.copy(title = title)
+                ?: Playlist(title = title, url = url, source = DataSource.Xtream)
         }
         val seriesPlaylist = XtreamInput.encodeToPlaylistUrl(
             input = input.copy(type = DataSource.Xtream.TYPE_SERIES),
@@ -236,14 +217,8 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         ).let { url ->
             playlistDao.get(url)
                 ?.takeIf { it.source == DataSource.Xtream }
-                ?.copy(
-                    title = title
-                )
-                ?: Playlist(
-                    title = title,
-                    url = url,
-                    source = DataSource.Xtream
-                )
+                ?.copy(title = title)
+                ?: Playlist(title = title, url = url, source = DataSource.Xtream)
         }
 
         val favOrHiddenRelationIds = channelDao.getFavOrHiddenRelationIdsByPlaylistUrl(
@@ -260,37 +235,22 @@ internal class PlaylistRepositoryImpl @Inject constructor(
 
         if (requiredLives) {
             when (playlistStrategy) {
-                PlaylistStrategy.ALL -> {
-                    channelDao.deleteByPlaylistUrl(livePlaylist.url)
-                }
-
-                PlaylistStrategy.KEEP -> {
-                    channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(livePlaylist.url)
-                }
+                PlaylistStrategy.ALL -> channelDao.deleteByPlaylistUrl(livePlaylist.url)
+                PlaylistStrategy.KEEP -> channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(livePlaylist.url)
             }
             playlistDao.insertOrReplace(livePlaylist)
         }
         if (requiredVods) {
             when (playlistStrategy) {
-                PlaylistStrategy.ALL -> {
-                    channelDao.deleteByPlaylistUrl(vodPlaylist.url)
-                }
-
-                PlaylistStrategy.KEEP -> {
-                    channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(vodPlaylist.url)
-                }
+                PlaylistStrategy.ALL -> channelDao.deleteByPlaylistUrl(vodPlaylist.url)
+                PlaylistStrategy.KEEP -> channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(vodPlaylist.url)
             }
             playlistDao.insertOrReplace(vodPlaylist)
         }
         if (requiredSeries) {
             when (playlistStrategy) {
-                PlaylistStrategy.ALL -> {
-                    channelDao.deleteByPlaylistUrl(seriesPlaylist.url)
-                }
-
-                PlaylistStrategy.KEEP -> {
-                    channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(seriesPlaylist.url)
-                }
+                PlaylistStrategy.ALL -> channelDao.deleteByPlaylistUrl(seriesPlaylist.url)
+                PlaylistStrategy.KEEP -> channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(seriesPlaylist.url)
             }
             playlistDao.insertOrReplace(seriesPlaylist)
         }
@@ -298,7 +258,7 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         var currentCount = 0
         callback(currentCount)
 
-        val cache = createCoroutineCache(BUFFER_XTREAM_CAPACITY) { all ->
+        val cache = createCoroutineCache<Channel>(BUFFER_XTREAM_CAPACITY) { all ->
             currentCount += all.size
             callback(currentCount)
             channelDao.insertOrReplaceAll(*all.toTypedArray())
@@ -339,9 +299,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
                         )
                     }
 
-                    // we save serial as channel
-                    // when we click the serial channel, we should call serialInfo api
-                    // for its episodes.
                     is XtreamSerial -> {
                         val favOrHidden = with(current.seriesId) {
                             val relationId = this.toString()
@@ -364,24 +321,20 @@ internal class PlaylistRepositoryImpl @Inject constructor(
     }
 
     override suspend fun insertEpgAsPlaylist(title: String, epg: String) {
-        // just save epg playlist to db
         playlistDao.insertOrReplace(
-            Playlist(
-                title = title,
-                url = epg,
-                source = DataSource.EPG
-            )
+            Playlist(title = title, url = epg, source = DataSource.EPG)
         )
     }
 
-    override suspend fun refresh(url: String) {
+    override suspend fun refresh(url: String) = logger.sandBox {
         val playlist = get(url) ?: run {
-            timber.w("Playlist not found for url: $url")
-            return
+            logger.post { "Playlist not found for url: $url" }
+            return@sandBox
         }
-        if (!playlist.refreshable) {
-            timber.w("Playlist is not refreshable: $playlist")
-            return
+        // Fixed: Use fromLocal instead of refreshable
+        if (playlist.fromLocal) {
+            logger.post { "Playlist is from local storage, skipping refresh: $playlist" }
+            return@sandBox
         }
 
         when (playlist.source) {
@@ -410,9 +363,7 @@ internal class PlaylistRepositoryImpl @Inject constructor(
     }
 
     override suspend fun backupOrThrow(uri: Uri): Unit = withContext(Dispatchers.IO) {
-        val json = Json {
-            prettyPrint = false
-        }
+        val json = Json { prettyPrint = false }
         val all = playlistDao.getAllWithChannels()
         context.contentResolver.openOutputStream(uri)?.use {
             val writer = it.bufferedWriter()
@@ -432,9 +383,7 @@ internal class PlaylistRepositoryImpl @Inject constructor(
     }
 
     override suspend fun restoreOrThrow(uri: Uri): Unit = withContext(Dispatchers.IO) {
-        val json = Json {
-            ignoreUnknownKeys = true
-        }
+        val json = Json { ignoreUnknownKeys = true }
         val mutex = Mutex()
         context.contentResolver.openInputStream(uri)?.use {
             val reader = it.bufferedReader()
@@ -564,7 +513,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             input = XtreamInput.decodeFromPlaylistUrl(playlist.url),
             seriesId = Url(series.url).rawSegments.last().toInt()
         )
-        // fixme: do not flatmap
         return seriesInfo.episodes.flatMap { it.value }
     }
 
@@ -583,7 +531,7 @@ internal class PlaylistRepositoryImpl @Inject constructor(
                 }
             }
 
-            is PlaylistRepository.EpgPlaylistUseCase.Upward -> {
+            is PlaylistRepository.EpgPlaylistUseCase.Upgrade -> {
                 val epgUrl = useCase.epgUrl
                 playlistDao.updateEpgUrls(useCase.playlistUrl) { epgUrls ->
                     val index = epgUrls.indexOf(epgUrl)
@@ -606,7 +554,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
 
     private val filenameWithTimezone: String get() = "File_${System.currentTimeMillis()}"
 
-    // Modified with `inline`
     private inline fun Reader.forEachLine(action: (String) -> Unit): Unit =
         useLines { it.forEach(action) }
 
@@ -641,7 +588,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             newUrl
         }
     }
-
 
     private fun openNetworkInput(url: String): InputStream? {
         val request = Request.Builder()
