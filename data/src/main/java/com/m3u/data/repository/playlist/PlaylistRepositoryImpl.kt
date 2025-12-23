@@ -5,12 +5,6 @@ import android.content.Context
 import android.net.Uri
 import androidx.core.net.toUri
 import androidx.work.WorkManager
-import com.m3u.core.architecture.logger.Logger
-import com.m3u.core.architecture.logger.Profiles
-import com.m3u.core.architecture.logger.execute
-import com.m3u.core.architecture.logger.install
-import com.m3u.core.architecture.logger.post
-import com.m3u.core.architecture.logger.sandBox
 import com.m3u.core.architecture.preferences.PlaylistStrategy
 import com.m3u.core.architecture.preferences.PreferencesKeys
 import com.m3u.core.architecture.preferences.Settings
@@ -26,8 +20,7 @@ import com.m3u.data.database.model.Channel
 import com.m3u.data.database.model.DataSource
 import com.m3u.data.database.model.Playlist
 import com.m3u.data.database.model.PlaylistWithChannels
-import com.m3u.data.database.model.PlaylistWithCount
-import com.m3u.data.database.model.fromLocal
+import com.m3u.data.database.model.refreshable
 import com.m3u.data.database.model.toMap
 import com.m3u.data.parser.m3u.M3UData
 import com.m3u.data.parser.m3u.M3UParser
@@ -65,6 +58,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import timber.log.Timber
 import java.io.File
 import java.io.InputStream
 import java.io.Reader
@@ -72,13 +66,13 @@ import javax.inject.Inject
 import kotlin.time.Duration.Companion.seconds
 
 private const val BUFFER_M3U_CAPACITY = 500
+private const val BUFFER_XTREAM_CAPACITY = 100
 private const val BUFFER_RESTORE_CAPACITY = 400
 
 internal class PlaylistRepositoryImpl @Inject constructor(
     private val playlistDao: PlaylistDao,
     private val channelDao: ChannelDao,
     private val programmeDao: ProgrammeDao,
-    delegate: Logger,
     @OkhttpClient(true) private val okHttpClient: OkHttpClient,
     private val m3uParser: M3UParser,
     private val xtreamParser: XtreamParser,
@@ -86,57 +80,63 @@ internal class PlaylistRepositoryImpl @Inject constructor(
     @ApplicationContext private val context: Context,
     private val settings: Settings
 ) : PlaylistRepository {
-    private val logger = delegate.install(Profiles.REPOS_PLAYLIST)
+    private val timber = Timber.tag("PlaylistRepositoryImpl")
 
     override suspend fun m3uOrThrow(
         title: String,
         url: String,
         callback: (count: Int) -> Unit
     ) {
-        val actualUrl = url.actualUrl()
-        val newChannels = mutableListOf<Channel>()
-
+        // 1. 准备阶段
+        val internalUrl = url.copyToInternalDirPath()
+        timber.d("m3uOrThrow: url=$url, internalUrl=$internalUrl")
+        
+        // 准备一个列表暂存所有解析成功的 Channel
+        val validChannels = mutableListOf<Channel>()
+        
+        // 2. 解析与校验阶段 (不操作数据库删除)
+        // 使用 try-catch-finally 确保流关闭，并捕获解析错误
         try {
-            // 设置 20 秒超时，防止解析卡死
+            // 设定 20秒 超时，防止解析死循环或网络卡死
             withTimeout(20.seconds) {
                 val inputStream = when {
-                    url.isSupportedNetworkUrl() -> openNetworkInput(actualUrl)
-                    url.isSupportedAndroidUrl() -> openAndroidInput(actualUrl)
-                    else -> throw IllegalArgumentException("Unsupported URL scheme: $actualUrl")
-                } ?: throw IllegalArgumentException("Cannot open input stream for: $actualUrl")
+                    url.isSupportedNetworkUrl() -> openNetworkInput(internalUrl)
+                    url.isSupportedAndroidUrl() -> openAndroidInput(internalUrl)
+                    else -> null
+                } ?: throw IllegalArgumentException("Cannot open input stream for: $internalUrl")
 
                 inputStream.use { input ->
                     m3uParser.parse(input.buffered())
                         .collect { m3uData ->
-                            // 过滤逻辑：去掉空行和 # 开头的注释行
+                            // 【核心需求】过滤逻辑：
+                            // 1. 去除首尾空格
+                            // 2. 如果 URL 是空的，或者以 # 开头（注释），直接跳过
                             val cleanUrl = m3uData.url.trim()
                             if (cleanUrl.isBlank() || cleanUrl.startsWith("#")) {
-                                return@collect
+                                return@collect // 跳过这条，继续下一条
                             }
-                            newChannels.add(m3uData.toChannel(actualUrl))
+
+                            // 转换为 Channel 对象并存入内存列表
+                            validChannels.add(m3uData.toChannel(internalUrl))
+                            
+                            // 更新进度 (仅作为解析进度的展示)
+                            callback(validChannels.size)
                         }
                 }
             }
         } catch (e: Exception) {
-            logger.log("Parse failed: ${e.message}")
-            throw e
-        } catch (e: Throwable) {
-            // 捕获严重错误
-            logger.log("Critical parser error: ${e.message}")
-            throw RuntimeException("Critical error: ${e.message}", e)
+            // 如果在下载或解析过程中出错，直接抛出异常
+            // 此时数据库没有任何变动，旧数据得以保留
+            timber.e(e, "M3U parse failed")
+            throw e 
         }
 
-        if (newChannels.isEmpty()) {
-            throw RuntimeException("No valid channels found.")
+        if (validChannels.isEmpty()) {
+            throw RuntimeException("No valid channels found (check if all links are commented out).")
         }
 
+        // 3. 数据库写入阶段 (只有解析成功才会执行到这里)
         val playlistStrategy = settings[PreferencesKeys.PLAYLIST_STRATEGY]
-        val playlist = playlistDao.get(actualUrl)?.copy(
-            title = title,
-            source = DataSource.M3U
-        ) ?: Playlist(title = title, url = actualUrl, source = DataSource.M3U)
-        playlistDao.insertOrReplace(playlist)
-
         val favOrHiddenRelationIds = when (playlistStrategy) {
             PlaylistStrategy.ALL -> emptyList()
             else -> channelDao.getFavOrHiddenRelationIdsByPlaylistUrl(url)
@@ -146,12 +146,21 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             else -> channelDao.getFavOrHiddenUrlsByPlaylistUrlNotContainsRelationId(url)
         }
 
+        // 先清理旧数据
         when (playlistStrategy) {
             PlaylistStrategy.ALL -> channelDao.deleteByPlaylistUrl(url)
             PlaylistStrategy.KEEP -> channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(url)
         }
 
-        val finalChannels = newChannels.filterNot { channel ->
+        // 更新 Playlist 信息
+        val playlist = playlistDao.get(internalUrl)?.copy(
+            title = title,
+            source = DataSource.M3U
+        ) ?: Playlist(title, internalUrl, source = DataSource.M3U)
+        playlistDao.insertOrReplace(playlist)
+
+        // 过滤需要保留的收藏/隐藏状态
+        val finalChannels = validChannels.filterNot { channel ->
             val relationId = channel.relationId
             when {
                 relationId == null || relationId.isBlank() -> channel.url in favOrHiddenUrls
@@ -159,9 +168,10 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             }
         }
 
+        // 批量插入新数据
+        // 使用 chunked 防止一次插入过多导致事务过大（虽然 Room 可以处理，但分批更稳妥）
         finalChannels.chunked(BUFFER_M3U_CAPACITY).forEach { batch ->
             channelDao.insertOrReplaceAll(*batch.toTypedArray())
-            callback(finalChannels.size)
         }
     }
 
@@ -174,94 +184,475 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         callback: (count: Int) -> Unit
     ): Unit = withContext(Dispatchers.IO) {
         val input = XtreamInput(basicUrl, username, password, type)
-        val (liveCategories, vodCategories, serialCategories, allowedOutputFormats, serverProtocol, port) = xtreamParser.getXtreamOutput(input)
-        val liveContainerExtension = if ("ts" in allowedOutputFormats) "ts" else allowedOutputFormats.firstOrNull() ?: "ts"
+        val (
+            liveCategories,
+            vodCategories,
+            serialCategories,
+            allowedOutputFormats,
+            serverProtocol,
+            port
+        ) = xtreamParser.getXtreamOutput(input)
 
-        val livePlaylist = XtreamInput.encodeToPlaylistUrl(input.copy(type = DataSource.Xtream.TYPE_LIVE), serverProtocol, port).let { url -> playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) ?: Playlist(title = title, url = url, source = DataSource.Xtream) }
-        val vodPlaylist = XtreamInput.encodeToPlaylistUrl(input.copy(type = DataSource.Xtream.TYPE_VOD), serverProtocol, port).let { url -> playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) ?: Playlist(title = title, url = url, source = DataSource.Xtream) }
-        val seriesPlaylist = XtreamInput.encodeToPlaylistUrl(input.copy(type = DataSource.Xtream.TYPE_SERIES), serverProtocol, port).let { url -> playlistDao.get(url)?.takeIf { it.source == DataSource.Xtream }?.copy(title = title) ?: Playlist(title = title, url = url, source = DataSource.Xtream) }
+        // we like ts but not m3u8.
+        val liveContainerExtension = if ("ts" in allowedOutputFormats) "ts"
+        else allowedOutputFormats.firstOrNull() ?: "ts"
 
-        val newChannels = mutableListOf<Channel>()
-        try {
-            xtreamParser.parse(input).collect { current ->
-                val channel = when (current) {
-                    is XtreamLive -> current.toChannel(basicUrl, username, password, livePlaylist.url, liveCategories.find { it.categoryId == current.categoryId }?.categoryName.orEmpty(), liveContainerExtension)
-                    is XtreamVod -> current.toChannel(basicUrl, username, password, vodPlaylist.url, vodCategories.find { it.categoryId == current.categoryId }?.categoryName.orEmpty())
-                    is XtreamSerial -> current.asChannel(basicUrl, username, password, seriesPlaylist.url, serialCategories.find { it.categoryId == current.categoryId }?.categoryName.orEmpty())
-                }
-                newChannels.add(channel)
-            }
-        } catch (e: Exception) { logger.log("Xtream parse failed: ${e.message}"); throw e }
+        val livePlaylist = XtreamInput.encodeToPlaylistUrl(
+            input = input.copy(type = DataSource.Xtream.TYPE_LIVE),
+            serverProtocol = serverProtocol,
+            port = port
+        ).let { url ->
+            playlistDao.get(url)
+                ?.takeIf { it.source == DataSource.Xtream }
+                ?.copy(
+                    title = title
+                )
+                ?: Playlist(
+                    title = title,
+                    url = url,
+                    source = DataSource.Xtream
+                )
+        }
+        val vodPlaylist = XtreamInput.encodeToPlaylistUrl(
+            input = input.copy(type = DataSource.Xtream.TYPE_VOD),
+            serverProtocol = serverProtocol,
+            port = port
+        ).let { url ->
+            playlistDao.get(url)
+                ?.takeIf { it.source == DataSource.Xtream }
+                ?.copy(
+                    title = title
+                )
+                ?: Playlist(
+                    title = title,
+                    url = url,
+                    source = DataSource.Xtream
+                )
+        }
+        val seriesPlaylist = XtreamInput.encodeToPlaylistUrl(
+            input = input.copy(type = DataSource.Xtream.TYPE_SERIES),
+            serverProtocol = serverProtocol,
+            port = port
+        ).let { url ->
+            playlistDao.get(url)
+                ?.takeIf { it.source == DataSource.Xtream }
+                ?.copy(
+                    title = title
+                )
+                ?: Playlist(
+                    title = title,
+                    url = url,
+                    source = DataSource.Xtream
+                )
+        }
 
-        if (newChannels.isEmpty()) throw RuntimeException("Xtream source is empty, aborting.")
+        val favOrHiddenRelationIds = channelDao.getFavOrHiddenRelationIdsByPlaylistUrl(
+            livePlaylist.url,
+            vodPlaylist.url,
+            seriesPlaylist.url
+        )
 
         val requiredLives = type == null || type == DataSource.Xtream.TYPE_LIVE
         val requiredVods = type == null || type == DataSource.Xtream.TYPE_VOD
         val requiredSeries = type == null || type == DataSource.Xtream.TYPE_SERIES
+
         val playlistStrategy = settings[PreferencesKeys.PLAYLIST_STRATEGY]
 
-        if (requiredLives) updatePlaylistAndClearOld(livePlaylist, playlistStrategy)
-        if (requiredVods) updatePlaylistAndClearOld(vodPlaylist, playlistStrategy)
-        if (requiredSeries) updatePlaylistAndClearOld(seriesPlaylist, playlistStrategy)
+        if (requiredLives) {
+            when (playlistStrategy) {
+                PlaylistStrategy.ALL -> {
+                    channelDao.deleteByPlaylistUrl(livePlaylist.url)
+                }
 
-        val favOrHiddenRelationIds = channelDao.getFavOrHiddenRelationIdsByPlaylistUrl(livePlaylist.url, vodPlaylist.url, seriesPlaylist.url)
-        val finalChannels = newChannels.filterNot { channel -> val relationId = channel.relationId; relationId != null && relationId in favOrHiddenRelationIds }
-        finalChannels.chunked(BUFFER_M3U_CAPACITY).forEach { batch -> channelDao.insertOrReplaceAll(*batch.toTypedArray()); callback(finalChannels.size) }
-    }
-    
-    private suspend fun updatePlaylistAndClearOld(playlist: Playlist, strategy: Int) {
-        playlistDao.insertOrReplace(playlist)
-        when (strategy) {
-            PlaylistStrategy.ALL -> channelDao.deleteByPlaylistUrl(playlist.url)
-            PlaylistStrategy.KEEP -> channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(playlist.url)
+                PlaylistStrategy.KEEP -> {
+                    channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(livePlaylist.url)
+                }
+            }
+            playlistDao.insertOrReplace(livePlaylist)
         }
-    }
-    
-    private fun openNetworkInput(url: String): InputStream? {
-        val request = Request.Builder().url(url).build()
-        val response = okHttpClient.newCall(request).execute()
-        return if (response.isSuccessful) response.body?.byteStream() else null
+        if (requiredVods) {
+            when (playlistStrategy) {
+                PlaylistStrategy.ALL -> {
+                    channelDao.deleteByPlaylistUrl(vodPlaylist.url)
+                }
+
+                PlaylistStrategy.KEEP -> {
+                    channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(vodPlaylist.url)
+                }
+            }
+            playlistDao.insertOrReplace(vodPlaylist)
+        }
+        if (requiredSeries) {
+            when (playlistStrategy) {
+                PlaylistStrategy.ALL -> {
+                    channelDao.deleteByPlaylistUrl(seriesPlaylist.url)
+                }
+
+                PlaylistStrategy.KEEP -> {
+                    channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(seriesPlaylist.url)
+                }
+            }
+            playlistDao.insertOrReplace(seriesPlaylist)
+        }
+
+        var currentCount = 0
+        callback(currentCount)
+
+        val cache = createCoroutineCache(BUFFER_XTREAM_CAPACITY) { all ->
+            currentCount += all.size
+            callback(currentCount)
+            channelDao.insertOrReplaceAll(*all.toTypedArray())
+        }
+
+        xtreamParser
+            .parse(input)
+            .mapNotNull { current ->
+                when (current) {
+                    is XtreamLive -> {
+                        val favOrHidden = with(current.streamId) {
+                            val relationId = this.toString()
+                            this != null && relationId in favOrHiddenRelationIds
+                        }
+                        if (favOrHidden) return@mapNotNull null
+                        current.toChannel(
+                            basicUrl = basicUrl,
+                            username = username,
+                            password = password,
+                            playlistUrl = livePlaylist.url,
+                            category = liveCategories.find { it.categoryId == current.categoryId }?.categoryName.orEmpty(),
+                            containerExtension = liveContainerExtension
+                        )
+                    }
+
+                    is XtreamVod -> {
+                        val favOrHidden = with(current.streamId) {
+                            val relationId = this.toString()
+                            this != null && relationId in favOrHiddenRelationIds
+                        }
+                        if (favOrHidden) return@mapNotNull null
+                        current.toChannel(
+                            basicUrl = basicUrl,
+                            username = username,
+                            password = password,
+                            playlistUrl = vodPlaylist.url,
+                            category = vodCategories.find { it.categoryId == current.categoryId }?.categoryName.orEmpty()
+                        )
+                    }
+
+                    // we save serial as channel
+                    // when we click the serial channel, we should call serialInfo api
+                    // for its episodes.
+                    is XtreamSerial -> {
+                        val favOrHidden = with(current.seriesId) {
+                            val relationId = this.toString()
+                            this != null && relationId in favOrHiddenRelationIds
+                        }
+                        if (favOrHidden) return@mapNotNull null
+                        current.asChannel(
+                            basicUrl = basicUrl,
+                            username = username,
+                            password = password,
+                            playlistUrl = seriesPlaylist.url,
+                            category = serialCategories.find { it.categoryId == current.categoryId }?.categoryName.orEmpty()
+                        )
+                    }
+                }
+            }
+            .onEach(cache::push)
+            .onCompletion { cache.flush() }
+            .collect()
     }
 
-    override suspend fun insertEpgAsPlaylist(title: String, epg: String) { playlistDao.insertOrReplace(Playlist(title = title, url = epg, source = DataSource.EPG)) }
-    override suspend fun refresh(url: String) = logger.sandBox {
-        val playlist = checkNotNull(get(url)) { "Cannot find playlist: $url" }
-        check(!playlist.fromLocal)
+    override suspend fun insertEpgAsPlaylist(title: String, epg: String) {
+        // just save epg playlist to db
+        playlistDao.insertOrReplace(
+            Playlist(
+                title = title,
+                url = epg,
+                source = DataSource.EPG
+            )
+        )
+    }
+
+    override suspend fun refresh(url: String) {
+        val playlist = get(url) ?: run {
+            timber.w("Playlist not found for url: $url")
+            return
+        }
+        if (!playlist.refreshable) {
+            timber.w("Playlist is not refreshable: $playlist")
+            return
+        }
+
         when (playlist.source) {
-            DataSource.M3U -> SubscriptionWorker.m3u(workManager, playlist.title, url)
-            DataSource.EPG -> SubscriptionWorker.epg(workManager, url, true)
-            DataSource.Xtream -> { val xtreamInput = XtreamInput.decodeFromPlaylistUrl(url); SubscriptionWorker.xtream(workManager, playlist.title, url, xtreamInput.basicUrl, xtreamInput.username, xtreamInput.password) }
-            else -> throw IllegalStateException("Unsupported source")
+            DataSource.M3U -> {
+                SubscriptionWorker.m3u(workManager, playlist.title, url)
+            }
+
+            DataSource.EPG -> {
+                SubscriptionWorker.epg(workManager, url, true)
+            }
+
+            DataSource.Xtream -> {
+                val xtreamInput = XtreamInput.decodeFromPlaylistUrl(url)
+                SubscriptionWorker.xtream(
+                    workManager = workManager,
+                    title = playlist.title,
+                    url = url,
+                    basicUrl = xtreamInput.basicUrl,
+                    username = xtreamInput.username,
+                    password = xtreamInput.password
+                )
+            }
+
+            else -> throw IllegalStateException("Refresh data source ${playlist.source} is unsupported currently.")
         }
     }
-    override suspend fun backupOrThrow(uri: Uri): Unit = withContext(Dispatchers.IO) { val json = Json { prettyPrint = false }; val all = playlistDao.getAllWithChannels(); context.contentResolver.openOutputStream(uri)?.use { val writer = it.bufferedWriter(); all.forEach { (playlist, channels) -> if (playlist.fromLocal) return@forEach; val encodedPlaylist = json.encodeToString(playlist); writer.appendLine(BackupOrRestoreContracts.wrapPlaylist(encodedPlaylist)); channels.forEach { channel -> val encodedChannel = json.encodeToString(channel); writer.appendLine(BackupOrRestoreContracts.wrapChannel(encodedChannel)) } }; writer.flush() } }
-    override suspend fun restoreOrThrow(uri: Uri) = logger.sandBox { withContext(Dispatchers.IO) { val json = Json { ignoreUnknownKeys = true }; val mutex = Mutex(); context.contentResolver.openInputStream(uri)?.use { val reader = it.bufferedReader(); val channels = mutableListOf<Channel>(); reader.forEachLine { line -> if (line.isBlank()) return@forEachLine; val encodedPlaylist = BackupOrRestoreContracts.unwrapPlaylist(line); val encodedChannel = BackupOrRestoreContracts.unwrapChannel(line); when { encodedPlaylist != null -> playlistDao.insertOrReplace(json.decodeFromString<Playlist>(encodedPlaylist)); encodedChannel != null -> { val channel = json.decodeFromString<Channel>(encodedChannel); channels.add(channel); if (channels.size >= BUFFER_RESTORE_CAPACITY) { mutex.withLock { if (channels.size >= BUFFER_RESTORE_CAPACITY) { channelDao.insertOrReplaceAll(*channels.toTypedArray()); channels.clear() } } } } } }; mutex.withLock { channelDao.insertOrReplaceAll(*channels.toTypedArray()) } } } }
-    override suspend fun pinOrUnpinCategory(url: String, category: String) { playlistDao.updatePinnedCategories(url) { if (category in it) it - category else it + category } }
-    override suspend fun hideOrUnhideCategory(url: String, category: String) { playlistDao.hideOrUnhideCategory(url, category) }
-    override fun observeAll(): Flow<List<Playlist>> = playlistDao.observeAll().catch { emit(emptyList()) }
-    override fun observeAllEpgs(): Flow<List<Playlist>> = playlistDao.observeAllEpgs().catch { emit(emptyList()) }
-    override fun observePlaylistUrls(): Flow<List<String>> = playlistDao.observePlaylistUrls().catch { emit(emptyList()) }
-    override fun observe(url: String): Flow<Playlist?> = playlistDao.observeByUrl(url).catch { emit(null) }
-    override fun observePlaylistWithChannels(url: String): Flow<PlaylistWithChannels?> = playlistDao.observeByUrlWithChannels(url).catch { emit(null) }
+
+    override suspend fun backupOrThrow(uri: Uri): Unit = withContext(Dispatchers.IO) {
+        val json = Json {
+            prettyPrint = false
+        }
+        val all = playlistDao.getAllWithChannels()
+        context.contentResolver.openOutputStream(uri)?.use {
+            val writer = it.bufferedWriter()
+            all.forEach { (playlist, channels) ->
+                val encodedPlaylist = json.encodeToString(playlist)
+                val wrappedPlaylist = BackupOrRestoreContracts.wrapPlaylist(encodedPlaylist)
+                writer.appendLine(wrappedPlaylist)
+
+                channels.forEach { channel ->
+                    val encodedChannel = json.encodeToString(channel)
+                    val wrappedChannel = BackupOrRestoreContracts.wrapChannel(encodedChannel)
+                    writer.appendLine(wrappedChannel)
+                }
+            }
+            writer.flush()
+        }
+    }
+
+    override suspend fun restoreOrThrow(uri: Uri): Unit = withContext(Dispatchers.IO) {
+        val json = Json {
+            ignoreUnknownKeys = true
+        }
+        val mutex = Mutex()
+        context.contentResolver.openInputStream(uri)?.use {
+            val reader = it.bufferedReader()
+
+            val channels = mutableListOf<Channel>()
+            reader.forEachLine { line ->
+                if (line.isBlank()) return@forEachLine
+                val encodedPlaylist = BackupOrRestoreContracts.unwrapPlaylist(line)
+                val encodedChannel = BackupOrRestoreContracts.unwrapChannel(line)
+                when {
+                    encodedPlaylist != null -> {
+                        val playlist = json.decodeFromString<Playlist>(encodedPlaylist)
+                        playlistDao.insertOrReplace(playlist)
+                    }
+
+                    encodedChannel != null -> {
+                        val channel = json.decodeFromString<Channel>(encodedChannel)
+                        channels.add(channel)
+                        if (channels.size >= BUFFER_RESTORE_CAPACITY) {
+                            mutex.withLock {
+                                if (channels.size >= BUFFER_RESTORE_CAPACITY) {
+                                    channelDao.insertOrReplaceAll(*channels.toTypedArray())
+                                    channels.clear()
+                                }
+                            }
+                        }
+                    }
+
+                    else -> {}
+                }
+            }
+            mutex.withLock {
+                channelDao.insertOrReplaceAll(*channels.toTypedArray())
+            }
+        }
+    }
+
+    override suspend fun pinOrUnpinCategory(url: String, category: String) {
+        playlistDao.updatePinnedCategories(url) { prev ->
+            if (category in prev) prev - category
+            else prev + category
+        }
+    }
+
+    override suspend fun hideOrUnhideCategory(url: String, category: String) {
+        playlistDao.hideOrUnhideCategory(url, category)
+    }
+
+    override fun observeAll(): Flow<List<Playlist>> = playlistDao
+        .observeAll()
+        .catch { emit(emptyList()) }
+
+    override fun observeAllEpgs(): Flow<List<Playlist>> = playlistDao
+        .observeAllEpgs()
+        .catch { emit(emptyList()) }
+
+    override fun observePlaylistUrls(): Flow<List<String>> = playlistDao
+        .observePlaylistUrls()
+        .catch { emit(emptyList()) }
+
+    override fun observe(url: String): Flow<Playlist?> = playlistDao
+        .observeByUrl(url)
+        .catch { emit(null) }
+
+    override fun observePlaylistWithChannels(url: String): Flow<PlaylistWithChannels?> = playlistDao
+        .observeByUrlWithChannels(url)
+        .catch { emit(null) }
+
     override suspend fun getPlaylistWithChannels(url: String): PlaylistWithChannels? = playlistDao.getByUrlWithChannels(url)
+
     override suspend fun get(url: String): Playlist? = playlistDao.get(url)
+
     override suspend fun getAll(): List<Playlist> = playlistDao.getAll()
+
     override suspend fun getAllAutoRefresh(): List<Playlist> = playlistDao.getAllAutoRefresh()
+
     override suspend fun getBySource(source: DataSource): List<Playlist> = playlistDao.getBySource(source)
-    override suspend fun getCategoriesByPlaylistUrlIgnoreHidden(url: String, query: String): List<String> = playlistDao.get(url)?.let { playlist -> channelDao.getCategoriesByPlaylistUrl(url, query).filterNot { it in playlist.hiddenCategories }.sortedByDescending { it in playlist.pinnedCategories } } ?: emptyList()
-    override fun observeCategoriesByPlaylistUrlIgnoreHidden(url: String, query: String): Flow<List<String>> = playlistDao.observeByUrl(url).flatMapLatest { playlist -> playlist ?: return@flatMapLatest flowOf(); channelDao.observeCategoriesByPlaylistUrl(playlist.url, query).map { categories -> categories.filterNot { it in playlist.hiddenCategories }.sortedByDescending { it in playlist.pinnedCategories } } }.flowOn(Dispatchers.Default)
-    override suspend fun unsubscribe(url: String): Playlist? { val playlist = playlistDao.get(url); channelDao.deleteByPlaylistUrl(url); playlist?.also { playlistDao.delete(it) }; return playlist }
-    override suspend fun onUpdatePlaylistTitle(url: String, title: String) { playlistDao.updateTitle(url, title) }
-    override suspend fun onUpdatePlaylistUserAgent(url: String, userAgent: String?) { playlistDao.updateUserAgent(url, userAgent) }
-    override fun observeAllCounts(): Flow<Map<Playlist, Int>> = playlistDao.observeAllCounts().map { it.toMap() }.catch { emit(emptyMap()) }
-    override suspend fun readEpisodesOrThrow(series: Channel): List<XtreamChannelInfo.Episode> { val playlist = checkNotNull(get(series.playlistUrl)); val seriesInfo = xtreamParser.getSeriesInfoOrThrow(XtreamInput.decodeFromPlaylistUrl(playlist.url), Url(series.url).rawSegments.last().toInt()); return seriesInfo.episodes.flatMap { it.value } }
-    override suspend fun deleteEpgPlaylistAndProgrammes(epgUrl: String) { playlistDao.deleteByUrl(epgUrl); programmeDao.deleteAllByEpgUrl(epgUrl); playlistDao.removeEpgUrlForAllPlaylists(epgUrl) }
-    override suspend fun onUpdateEpgPlaylist(useCase: PlaylistRepository.EpgPlaylistUseCase) { when (useCase) { is PlaylistRepository.EpgPlaylistUseCase.Check -> playlistDao.updateEpgUrls(useCase.playlistUrl) { if (useCase.action) it + useCase.epgUrl else it - useCase.epgUrl }; is PlaylistRepository.EpgPlaylistUseCase.Upward -> playlistDao.updateEpgUrls(useCase.playlistUrl) { with(it) { val index = indexOf(useCase.epgUrl); if (index <= 0) it else take(index - 1) + useCase.epgUrl + this[index - 1] + drop(index + 1) } } } }
-    override suspend fun onUpdatePlaylistAutoRefreshProgrammes(playlistUrl: String) { val playlist = playlistDao.get(playlistUrl) ?: return; playlistDao.updatePlaylistAutoRefreshProgrammes(playlistUrl, !playlist.autoRefreshProgrammes) }
+
+    override suspend fun getCategoriesByPlaylistUrlIgnoreHidden(
+        url: String,
+        query: String
+    ): List<String> = playlistDao.get(url).let { playlist ->
+        val pinnedCategories = playlist?.pinnedCategories ?: emptyList()
+        val hiddenCategories = playlist?.hiddenCategories ?: emptyList()
+        channelDao
+            .getCategoriesByPlaylistUrl(url, query)
+            .filterNot { it in hiddenCategories }
+            .sortedByDescending { it in pinnedCategories }
+    }
+
+    override fun observeCategoriesByPlaylistUrlIgnoreHidden(
+        url: String,
+        query: String
+    ): Flow<List<String>> = playlistDao.observeByUrl(url).flatMapLatest { playlist ->
+        playlist ?: return@flatMapLatest flowOf()
+        val pinnedCategories = playlist.pinnedCategories
+        val hiddenCategories = playlist.hiddenCategories
+        channelDao
+            .observeCategoriesByPlaylistUrl(playlist.url, query)
+            .map { categories ->
+                categories
+                    .filterNot { it in hiddenCategories }
+                    .sortedByDescending { it in pinnedCategories }
+            }
+    }
+        .flowOn(Dispatchers.Default)
+
+    override suspend fun unsubscribe(url: String): Playlist? {
+        val playlist = playlistDao.get(url)
+        channelDao.deleteByPlaylistUrl(url)
+        return playlist?.also {
+            playlistDao.delete(it)
+        }
+    }
+
+    override suspend fun onUpdatePlaylistTitle(url: String, title: String) = playlistDao.updateTitle(url, title)
+
+    override suspend fun onUpdatePlaylistUserAgent(url: String, userAgent: String?) = playlistDao.updateUserAgent(url, userAgent)
+
+    override fun observeAllCounts(): Flow<Map<Playlist, Int>> = playlistDao.observeAllCounts()
+            .map { it.toMap() }
+            .catch { emit(emptyMap()) }
+
+    override suspend fun readEpisodesOrThrow(series: Channel): List<XtreamChannelInfo.Episode> {
+        val playlist = checkNotNull(get(series.playlistUrl)) { "playlist is not exist" }
+        val seriesInfo = xtreamParser.getSeriesInfoOrThrow(
+            input = XtreamInput.decodeFromPlaylistUrl(playlist.url),
+            seriesId = Url(series.url).rawSegments.last().toInt()
+        )
+        // fixme: do not flatmap
+        return seriesInfo.episodes.flatMap { it.value }
+    }
+
+    override suspend fun deleteEpgPlaylistAndProgrammes(epgUrl: String) {
+        playlistDao.deleteByUrl(epgUrl)
+        programmeDao.deleteAllByEpgUrl(epgUrl)
+        playlistDao.removeEpgUrlForAllPlaylists(epgUrl)
+    }
+
+    override suspend fun onUpdateEpgPlaylist(useCase: PlaylistRepository.EpgPlaylistUseCase) {
+        when (useCase) {
+            is PlaylistRepository.EpgPlaylistUseCase.Check -> {
+                playlistDao.updateEpgUrls(useCase.playlistUrl) { epgUrls ->
+                    if (useCase.action) epgUrls + useCase.epgUrl
+                    else epgUrls - useCase.epgUrl
+                }
+            }
+
+            is PlaylistRepository.EpgPlaylistUseCase.Upward -> {
+                val epgUrl = useCase.epgUrl
+                playlistDao.updateEpgUrls(useCase.playlistUrl) { epgUrls ->
+                    val index = epgUrls.indexOf(epgUrl)
+                    if (index <= 0) epgUrls
+                    else with(epgUrls) {
+                        take(index - 1) + epgUrl + this[index - 1] + drop(index + 1)
+                    }
+                }
+            }
+        }
+    }
+
+    override suspend fun onUpdatePlaylistAutoRefreshProgrammes(playlistUrl: String) {
+        val playlist = playlistDao.get(playlistUrl) ?: return
+        playlistDao.updatePlaylistAutoRefreshProgrammes(
+            playlistUrl,
+            !playlist.autoRefreshProgrammes
+        )
+    }
+
     private val filenameWithTimezone: String get() = "File_${System.currentTimeMillis()}"
-    private inline fun Reader.forEachLine(action: (String) -> Unit): Unit = useLines { it.forEach(action) }
-    private fun String.isSupportedNetworkUrl(): Boolean = startsWithAny("http://", "https://", ignoreCase = true)
-    private fun String.isSupportedAndroidUrl(): Boolean = startsWithAny(ContentResolver.SCHEME_FILE, ContentResolver.SCHEME_CONTENT, ignoreCase = true)
-    private suspend fun String.actualUrl(): String { if (!isSupportedAndroidUrl()) return this; val uri = this.toUri(); if (uri.scheme == ContentResolver.SCHEME_FILE) return uri.toString(); return withContext(Dispatchers.IO) { val contentResolver = context.contentResolver; val filename = uri.readFileName(contentResolver) ?: filenameWithTimezone; val destinationFile = File(context.filesDir, filename); if (!uri.copyToFile(contentResolver, destinationFile)) return@withContext this@actualUrl; val newUrl = Uri.decode(destinationFile.toUri().toString()); playlistDao.updateUrl(this@actualUrl, newUrl); newUrl } }
-    private fun openAndroidInput(url: String): InputStream? = context.contentResolver.openInputStream(url.toUri())
+
+    // Modified with `inline`
+    private inline fun Reader.forEachLine(action: (String) -> Unit): Unit =
+        useLines { it.forEach(action) }
+
+    private fun String.isSupportedNetworkUrl(): Boolean = startsWithAny(
+        "http://",
+        "https://",
+        ignoreCase = true
+    )
+
+    private fun String.isSupportedAndroidUrl(): Boolean = startsWithAny(
+        ContentResolver.SCHEME_FILE,
+        ContentResolver.SCHEME_CONTENT,
+        ignoreCase = true
+    )
+
+    private suspend fun String.copyToInternalDirPath(): String {
+        if (!isSupportedAndroidUrl()) return this
+        val uri = this.toUri()
+        if (uri.scheme == ContentResolver.SCHEME_FILE) return uri.toString()
+        return withContext(Dispatchers.IO) {
+            val contentResolver = context.contentResolver
+            val filename = uri.readFileName(contentResolver) ?: filenameWithTimezone
+            val destinationFile = File(context.filesDir, filename)
+
+            val success = uri.copyToFile(contentResolver, destinationFile)
+            if (!success) {
+                return@withContext this@copyToInternalDirPath
+            }
+
+            val newUrl = Uri.decode(destinationFile.toUri().toString())
+            playlistDao.updateUrl(this@copyToInternalDirPath, newUrl)
+            newUrl
+        }
+    }
+
+
+    private fun openNetworkInput(url: String): InputStream? {
+        val request = Request.Builder()
+            .url(url)
+            .build()
+        val response = okHttpClient.newCall(request).execute()
+        return response.body?.byteStream()
+    }
+
+    private fun openAndroidInput(url: String): InputStream? {
+        val uri = url.toUri()
+        return context.contentResolver.openInputStream(uri)
+    }
 }

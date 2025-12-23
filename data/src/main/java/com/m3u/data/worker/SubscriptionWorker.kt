@@ -18,9 +18,6 @@ import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
-import com.m3u.core.architecture.logger.Logger
-import com.m3u.core.architecture.logger.Profiles
-import com.m3u.core.architecture.logger.install
 import com.m3u.data.R
 import com.m3u.data.database.model.DataSource
 import com.m3u.data.parser.xtream.XtreamInput
@@ -44,10 +41,7 @@ class SubscriptionWorker @AssistedInject constructor(
     private val programmeRepository: ProgrammeRepository,
     private val notificationManager: NotificationManager,
     private val workManager: WorkManager,
-    delegate: Logger
 ) : CoroutineWorker(context, params) {
-    private val logger = delegate.install(Profiles.WORKER_SUBSCRIPTION)
-
     private val dataSource = inputData
         .getString(INPUT_STRING_DATA_SOURCE_VALUE)
         ?.let { DataSource.ofOrNull(it) }
@@ -66,23 +60,37 @@ class SubscriptionWorker @AssistedInject constructor(
     override suspend fun doWork(): Result = coroutineScope {
         dataSource ?: return@coroutineScope Result.failure()
         createChannel()
-        
         coroutineContext[Job]?.invokeOnCompletion { cause ->
-            if (cause is CancellationException) {
-                notificationManager.cancel(notificationId)
+            when (cause) {
+                null -> {}
+                is CancellationException -> {
+                    notificationManager.cancel(notificationId)
+                }
+
+                else -> {
+                    createN10nBuilder()
+                        .setContentText(cause.localizedMessage.orEmpty())
+                        .setActions(retryAction)
+                        .setColor(Color.RED)
+                        .buildThenNotify()
+                }
             }
         }
-
-        try {
-            when (dataSource) {
-                DataSource.M3U -> {
-                    val title = title ?: return@coroutineScope Result.failure()
-                    val url = url ?: return@coroutineScope Result.failure()
-                    if (title.isEmpty()) {
-                        notifyError(context.getString(string.data_error_empty_title))
-                        Result.failure()
-                    } else {
+        when (dataSource) {
+            DataSource.M3U -> {
+                val title = title ?: return@coroutineScope Result.failure()
+                val url = url ?: return@coroutineScope Result.failure()
+                if (title.isEmpty()) {
+                    val message = context.getString(string.data_error_empty_title)
+                    createN10nBuilder()
+                        .setContentText(message)
+                        .buildThenNotify()
+                    Result.failure()
+                } else {
+                    // 【核心修改】添加 try-catch 捕获 M3U 更新异常
+                    try {
                         var total = 0
+                        // 这里的调用会先执行下载解析，如果失败会抛出异常，不会影响旧数据
                         playlistRepository.m3uOrThrow(title, url) { count ->
                             total = count
                             val notification = createN10nBuilder()
@@ -95,97 +103,167 @@ class SubscriptionWorker @AssistedInject constructor(
 
                         createN10nBuilder()
                             .setContentText(findCompleteContentText(total))
-                            .setOngoing(false)
-                            .setAutoCancel(true)
                             .buildThenNotify()
                         Result.success()
+                    } catch (e: Exception) {
+                        // 捕获异常，弹出通知提示用户失败原因
+                        createN10nBuilder()
+                            .setContentText(e.localizedMessage.orEmpty())
+                            .setActions(retryAction) // 提供重试按钮（如果需要）
+                            .setColor(Color.RED)     // 标记为红色错误
+                            .buildThenNotify()
+                        e.printStackTrace()
+                        // 返回 failure，停止重试
+                        Result.failure()
                     }
                 }
-                
-                DataSource.EPG -> {
-                    val playlistUrl = epgPlaylistUrl ?: return@coroutineScope Result.failure()
-                    // 【修复编译错误】使用位置参数，避免参数名错误
-                    // 顺序推测为：(playlistUrl: String, epgUrl: String, ignoreCache: Boolean)
+            }
+
+            DataSource.EPG -> {
+                val playlistUrl = epgPlaylistUrl ?: return@coroutineScope Result.failure()
+                val ignoreCache = epgIgnoreCache
+                try {
                     programmeRepository.checkOrRefreshProgrammesOrThrow(
-                        playlistUrl, 
-                        playlistUrl, 
-                        epgIgnoreCache
+                        playlistUrl,
+                        ignoreCache = ignoreCache
                     )
                         .onEach { count ->
                             val notification = createN10nBuilder()
                                 .setContentText(findProgrammeProgressContentText(count))
                                 .setActions(cancelAction)
-                                .setOngoing(true)
                                 .build()
                             notificationManager.notify(notificationId, notification)
                         }
                         .launchIn(this)
                     Result.success()
+                } catch (e: Exception) {
+                    createN10nBuilder()
+                        .setContentText(e.localizedMessage.orEmpty())
+                        .setActions(retryAction)
+                        .setColor(Color.RED)
+                        .buildThenNotify()
+                    e.printStackTrace()
+                    Result.failure()
                 }
+            }
 
-                DataSource.Xtream -> {
-                    title ?: return@coroutineScope Result.failure()
-                    val basicUrlSafe = basicUrl ?: return@coroutineScope Result.failure()
-                    val usernameSafe = username ?: return@coroutineScope Result.failure()
-                    val passwordSafe = password ?: return@coroutineScope Result.failure()
-
-                    if (title.isEmpty()) {
-                        url ?: return@coroutineScope Result.failure()
-                        notifyError(context.getString(string.data_error_empty_title))
-                        Result.failure()
-                    } else {
+            DataSource.Xtream -> {
+                title ?: return@coroutineScope Result.failure()
+                basicUrl ?: return@coroutineScope Result.failure()
+                username ?: return@coroutineScope Result.failure()
+                password ?: return@coroutineScope Result.failure()
+                if (title.isEmpty()) {
+                    url ?: return@coroutineScope Result.failure()
+                    val message = context.getString(string.data_error_empty_title)
+                    createN10nBuilder()
+                        .setContentText(message)
+                        .buildThenNotify()
+                    Result.failure()
+                } else {
+                    try {
                         val type = url?.let { XtreamInput.decodeFromPlaylistUrlOrNull(it)?.type }
                         var total = 0
                         playlistRepository.xtreamOrThrow(
-                            title, basicUrlSafe, usernameSafe, passwordSafe, type
+                            title, basicUrl, username, password, type
                         ) { count ->
                             total = count
                             val notification = createN10nBuilder()
                                 .setContentText(findChannelProgressContentText(count))
                                 .setActions(cancelAction)
-                                .setOngoing(true)
                                 .build()
                             notificationManager.notify(notificationId, notification)
                         }
                         createN10nBuilder()
                             .setContentText(findCompleteContentText(total))
-                            .setOngoing(false)
-                            .setAutoCancel(true)
                             .buildThenNotify()
                         Result.success()
+                    } catch (e: Exception) {
+                        createN10nBuilder()
+                            .setContentText(e.localizedMessage.orEmpty())
+                            .setActions(retryAction)
+                            .setColor(Color.RED)
+                            .buildThenNotify()
+                        Result.failure()
                     }
                 }
-                else -> Result.failure()
             }
-        } catch (e: Throwable) {
-            // 捕获所有错误（包括内存溢出、死循环导致的栈溢出等）
-            e.printStackTrace()
-            notifyError(e.message ?: "Unknown error")
-            Result.failure()
+
+            else -> {
+                // do nothing
+                Result.failure()
+            }
         }
     }
 
-    private fun notifyError(message: String) {
-        val notification = createN10nBuilder()
-            .setContentTitle("Update Failed") 
-            .setContentText(message)
-            .setSmallIcon(R.drawable.round_cancel_24) 
-            .setOngoing(false)
-            .setAutoCancel(true)
-            .build()
-        notificationManager.notify(notificationId, notification)
+    private fun createChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID, NOTIFICATION_NAME, NotificationManager.IMPORTANCE_LOW
+        )
+        channel.description = "display subscribe task progress"
+        notificationManager.createNotificationChannel(channel)
     }
 
-    private fun createChannel() { val channel = NotificationChannel(CHANNEL_ID, NOTIFICATION_NAME, NotificationManager.IMPORTANCE_LOW); channel.description = "display subscribe task progress"; notificationManager.createNotificationChannel(channel) }
-    private fun Notification.Builder.buildThenNotify() { notificationManager.notify(notificationId, build()) }
-    override suspend fun getForegroundInfo(): ForegroundInfo { return ForegroundInfo(notificationId, createN10nBuilder().build()) }
-    private fun createN10nBuilder(): Notification.Builder = Notification.Builder(context, CHANNEL_ID).setSmallIcon(R.drawable.round_file_download_24).setContentTitle(when (dataSource) { DataSource.EPG -> epgPlaylistUrl; else -> title }).setOngoing(true)
-    private fun findCancelActionTitle() = context.getString(string.data_worker_subscription_action_cancel)
-    private fun findRetryActionTitle() = context.getString(string.data_worker_subscription_action_retry)
-    private fun findCompleteContentText(total: Int) = context.getString(string.data_worker_subscription_content_completed, total)
-    private fun findChannelProgressContentText(count: Int) = context.getString(string.data_worker_subscription_content_channel_progress, count)
-    private fun findProgrammeProgressContentText(count: Int) = context.getString(string.data_worker_subscription_content_programme_progress, count)
-    private val cancelAction: Notification.Action by lazy { Notification.Action.Builder(Icon.createWithResource(context, R.drawable.round_cancel_24), findCancelActionTitle(), workManager.createCancelPendingIntent(id)).build() }
+    private fun Notification.Builder.buildThenNotify() {
+        if (isStopped) return
+        notificationManager.notify(notificationId, build())
+    }
+
+    override suspend fun getForegroundInfo(): ForegroundInfo {
+        return ForegroundInfo(notificationId, createN10nBuilder().build())
+    }
+
+    private fun createN10nBuilder(): Notification.Builder =
+        Notification.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.round_file_download_24)
+            .setContentTitle(
+                when (dataSource) {
+                    DataSource.EPG -> epgPlaylistUrl
+                    else -> title
+                }
+            )
+
+    private fun findCancelActionTitle() =
+        context.getString(string.data_worker_subscription_action_cancel)
+
+    private fun findRetryActionTitle() =
+        context.getString(string.data_worker_subscription_action_retry)
+
+    private fun findCompleteContentText(total: Int) =
+        context.getString(string.data_worker_subscription_content_completed, total)
+
+    private fun findChannelProgressContentText(count: Int) =
+        context.getString(string.data_worker_subscription_content_channel_progress, count)
+
+    private fun findProgrammeProgressContentText(count: Int) =
+        context.getString(string.data_worker_subscription_content_programme_progress, count)
+
+    private val cancelAction: Notification.Action by lazy {
+        Notification.Action.Builder(
+            Icon.createWithResource(
+                context,
+                R.drawable.round_cancel_24
+            ),
+            findCancelActionTitle(),
+            workManager.createCancelPendingIntent(id)
+        )
+            .build()
+    }
+    private val retryAction: Notification.Action by lazy {
+        Notification.Action.Builder(
+            Icon.createWithResource(
+                context,
+                R.drawable.round_refresh_24
+            ),
+            findRetryActionTitle(),
+            PendingIntent.getForegroundService(
+                context,
+                1234,
+                Intent(),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+        )
+            .build()
+    }
 
     companion object {
         private const val CHANNEL_ID = "subscribe_channel"
@@ -199,10 +277,135 @@ class SubscriptionWorker @AssistedInject constructor(
         private const val INPUT_STRING_PASSWORD = "password"
         private const val INPUT_STRING_DATA_SOURCE_VALUE = "data-source"
         const val TAG = "subscription"
-        
-        fun m3u(workManager: WorkManager, title: String, url: String) { workManager.cancelAllWorkByTag(url); val request = OneTimeWorkRequestBuilder<SubscriptionWorker>().setInputData(workDataOf(INPUT_STRING_TITLE to title, INPUT_STRING_URL to url, INPUT_STRING_DATA_SOURCE_VALUE to DataSource.M3U.value)).addTag(url).addTag(TAG).addTag(DataSource.M3U.value).setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST).setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).build(); workManager.enqueue(request) }
-        fun epg(workManager: WorkManager, playlistUrl: String, ignoreCache: Boolean) { workManager.cancelAllWorkByTag(playlistUrl); val request = OneTimeWorkRequestBuilder<SubscriptionWorker>().setInputData(workDataOf(INPUT_STRING_EPG_PLAYLIST_URL to playlistUrl, INPUT_BOOLEAN_EPG_IGNORE_CACHE to ignoreCache, INPUT_STRING_DATA_SOURCE_VALUE to DataSource.EPG.value)).addTag(playlistUrl).addTag(TAG).addTag(DataSource.EPG.value).setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST).setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).build(); workManager.enqueue(request) }
-        fun xtream(workManager: WorkManager, title: String, url: String, basicUrl: String, username: String, password: String) { workManager.cancelAllWorkByTag(url); workManager.cancelAllWorkByTag(basicUrl); val request = OneTimeWorkRequestBuilder<SubscriptionWorker>().setInputData(workDataOf(INPUT_STRING_TITLE to title, INPUT_STRING_URL to url, INPUT_STRING_BASIC_URL to basicUrl, INPUT_STRING_USERNAME to username, INPUT_STRING_PASSWORD to password, INPUT_STRING_DATA_SOURCE_VALUE to DataSource.Xtream.value)).addTag(url).addTag(basicUrl).addTag(DataSource.Xtream.value).addTag(TAG).setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST).setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).build(); workManager.enqueue(request) }
+
+        fun m3u(
+            workManager: WorkManager,
+            title: String,
+            url: String
+        ) {
+            workManager.cancelAllWorkByTag(url)
+            val request = OneTimeWorkRequestBuilder<SubscriptionWorker>()
+                .setInputData(
+                    workDataOf(
+                        INPUT_STRING_TITLE to title,
+                        INPUT_STRING_URL to url,
+                        INPUT_STRING_DATA_SOURCE_VALUE to DataSource.M3U.value
+                    )
+                )
+                .addTag(url)
+                .addTag(TAG)
+                .addTag(DataSource.M3U.value)
+                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build()
+                )
+                .build()
+            workManager.enqueue(request)
+        }
+
+        fun epg(
+            workManager: WorkManager,
+            playlistUrl: String,
+            ignoreCache: Boolean
+        ) {
+            workManager.cancelAllWorkByTag(playlistUrl)
+            val request = OneTimeWorkRequestBuilder<SubscriptionWorker>()
+                .setInputData(
+                    workDataOf(
+                        INPUT_STRING_EPG_PLAYLIST_URL to playlistUrl,
+                        INPUT_BOOLEAN_EPG_IGNORE_CACHE to ignoreCache,
+                        INPUT_STRING_DATA_SOURCE_VALUE to DataSource.EPG.value,
+                    )
+                )
+                .addTag(playlistUrl)
+                .addTag(TAG)
+                .addTag(DataSource.EPG.value)
+                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build()
+                )
+                .build()
+            workManager.enqueue(request)
+        }
+
+        fun xtream(
+            workManager: WorkManager,
+            title: String,
+            url: String,
+            basicUrl: String,
+            username: String,
+            password: String,
+        ) {
+            workManager.cancelAllWorkByTag(url)
+            workManager.cancelAllWorkByTag(basicUrl)
+            val request = OneTimeWorkRequestBuilder<SubscriptionWorker>()
+                .setInputData(
+                    workDataOf(
+                        INPUT_STRING_TITLE to title,
+                        INPUT_STRING_URL to url,
+                        INPUT_STRING_BASIC_URL to basicUrl,
+                        INPUT_STRING_USERNAME to username,
+                        INPUT_STRING_PASSWORD to password,
+                        INPUT_STRING_DATA_SOURCE_VALUE to DataSource.Xtream.value
+                    )
+                )
+                .addTag(url)
+                .addTag(basicUrl)
+                .addTag(DataSource.Xtream.value)
+                .apply {
+                    val xtreamInput = XtreamInput.decodeFromPlaylistUrlOrNull(url) ?: XtreamInput(
+                        basicUrl = basicUrl,
+                        username = username,
+                        password = password
+                    )
+                    val type = xtreamInput.type
+                    if (type == null) {
+                        addTag(
+                            XtreamInput.encodeToPlaylistUrl(
+                                xtreamInput.copy(
+                                    type = DataSource.Xtream.TYPE_LIVE
+                                )
+                            )
+                        )
+                        addTag(
+                            XtreamInput.encodeToPlaylistUrl(
+                                xtreamInput.copy(
+                                    type = DataSource.Xtream.TYPE_SERIES
+                                )
+                            )
+                        )
+                        addTag(
+                            XtreamInput.encodeToPlaylistUrl(
+                                xtreamInput.copy(
+                                    type = DataSource.Xtream.TYPE_VOD
+                                )
+                            )
+                        )
+                    } else {
+                        addTag(
+                            XtreamInput.encodeToPlaylistUrl(
+                                xtreamInput.copy(
+                                    type = type
+                                )
+                            )
+                        )
+                    }
+                }
+                .addTag(TAG)
+                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build()
+                )
+                .build()
+            workManager.enqueue(request)
+        }
+
         private val ATOMIC_NOTIFICATION_ID = AtomicInteger()
     }
 }
