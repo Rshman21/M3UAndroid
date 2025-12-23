@@ -1,5 +1,9 @@
 package com.m3u.smartphone.ui.material.components
 
+import android.app.Activity
+import android.view.WindowManager
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.ui.platform.LocalContext
 import android.view.Surface
 import androidx.annotation.OptIn
 import androidx.compose.runtime.Composable
@@ -54,12 +58,27 @@ fun Player(
     val keepScreenOn = state.keepScreenOn
     val clipMode = state.clipMode
 
+    val context = LocalContext.current
+    DisposableEffect(keepScreenOn) {
+        val window = (context as? Activity)?.window
+        
+        if (keepScreenOn) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+
+        onDispose {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
     AndroidView(
         modifier = modifier,
         factory = { context ->
             PlayerView(context).apply {
                 useController = false
-                videoSurfaceView
+                //videoSurfaceView
             }
         },
         update = { view ->
