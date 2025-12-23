@@ -137,6 +137,10 @@ fun ChannelRoute(
     val maskState = rememberMaskState()
     val pullPanelLayoutState = rememberPullPanelLayoutState()
 
+    LaunchedEffect(Unit) {
+        pullPanelLayoutState.expand()
+    }
+
     val isPanelExpanded = pullPanelLayoutState.isExpanded
     val fraction = pullPanelLayoutState.fraction
 
