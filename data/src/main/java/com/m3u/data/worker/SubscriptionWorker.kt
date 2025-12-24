@@ -87,10 +87,10 @@ class SubscriptionWorker @AssistedInject constructor(
                         .buildThenNotify()
                     Result.failure()
                 } else {
-                    // 【核心修改】添加 try-catch 捕获异常，确保 UI 能显示“更新失败”
+                    // 【关键修改】添加 try-catch 以捕获 Repository 抛出的下载/解析异常
                     try {
                         var total = 0
-                        // 现在如果解析失败或超时，这里会抛出异常，不再静默
+                        // 调用 Repository，如果有问题它会直接抛出异常
                         playlistRepository.m3uOrThrow(title, url) { count ->
                             total = count
                             val notification = createN10nBuilder()
@@ -106,14 +106,14 @@ class SubscriptionWorker @AssistedInject constructor(
                             .buildThenNotify()
                         Result.success()
                     } catch (e: Exception) {
-                        // 捕获异常后，发送红色错误通知
+                        // 捕获异常：显示红色错误通知
                         createN10nBuilder()
                             .setContentText(e.localizedMessage ?: "Update failed")
                             .setActions(retryAction)
                             .setColor(Color.RED)
                             .buildThenNotify()
                         e.printStackTrace()
-                        // 明确返回 Failure，停止重试
+                        // 返回 Failure，通知 WorkManager 停止重试
                         Result.failure()
                     }
                 }
