@@ -128,13 +128,17 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             .map { it.url }
             .toSet()
 
-        // 3. 遍历新频道，如果 URL 命中收藏集合，恢复收藏状态
-        if (favoriteUrls.isNotEmpty()) {
-            validChannels.forEach { channel ->
+        // 使用 map + copy 生成新列表，而不是直接修改原对象
+        val channelsWithFavorites = if (favoriteUrls.isNotEmpty()) {
+            validChannels.map { channel ->
                 if (channel.url in favoriteUrls) {
-                    channel.favourite = true
+                    channel.copy(favourite = true)
+                } else {
+                    channel
                 }
             }
+        } else {
+            validChannels
         }
         // ============================================================
 
@@ -161,8 +165,8 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         ) ?: Playlist(title, internalUrl, source = DataSource.M3U)
         playlistDao.insertOrReplace(playlist)
 
-        // 过滤并批量插入新数据
-        val finalChannels = validChannels.filterNot { channel ->
+        // 过滤并批量插入新数据 (使用合并过收藏状态的 channelsWithFavorites)
+        val finalChannels = channelsWithFavorites.filterNot { channel ->
             val relationId = channel.relationId
             when {
                 relationId == null || relationId.isBlank() -> channel.url in favOrHiddenUrls
@@ -264,7 +268,7 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         var currentCount = 0
         callback(currentCount)
 
-        val cache = createCoroutineCache(BUFFER_XTREAM_CAPACITY) { all ->
+        val cache = createCoroutineCache<Channel>(BUFFER_XTREAM_CAPACITY) { all ->
             currentCount += all.size
             callback(currentCount)
             channelDao.insertOrReplaceAll(*all.toTypedArray())
@@ -334,7 +338,6 @@ internal class PlaylistRepositoryImpl @Inject constructor(
 
     override suspend fun refresh(url: String) {
         val playlist = get(url) ?: return
-        // 修正：使用 fromLocal 替代 refreshable，避免编译错误
         if (playlist.fromLocal) {
             return
         }
