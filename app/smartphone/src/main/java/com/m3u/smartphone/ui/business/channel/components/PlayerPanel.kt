@@ -6,8 +6,10 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,7 +24,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.AbsoluteRoundedCornerShape
@@ -106,6 +107,8 @@ internal fun PlayerPanel(
     onRemindProgramme: (Programme) -> Unit,
     onCancelRemindProgramme: (Programme) -> Unit,
     onRequestClosed: () -> Unit,
+    // 【新增】长按回调
+    onChannelLongClick: (Channel) -> Unit
 ) {
     val spacing = LocalSpacing.current
 
@@ -143,7 +146,8 @@ internal fun PlayerPanel(
             onProgrammePressed = {
                 programme = it
                 animProgramme = it
-            }
+            },
+            onChannelLongClick = onChannelLongClick
         )
         LaunchedEffect(isPanelExpanded) {
             if (!isPanelExpanded) {
@@ -293,6 +297,7 @@ fun PlayerPanelImpl(
     modifier: Modifier = Modifier,
     onProgrammePressed: (Programme) -> Unit,
     onRequestClosed: () -> Unit,
+    onChannelLongClick: (Channel) -> Unit
 ) {
     val spacing = LocalSpacing.current
     Column(
@@ -345,7 +350,8 @@ fun PlayerPanelImpl(
                 // TODO
                 value = ChannelGalleryValue.PagingChannel(channels, channelId),
                 isPanelExpanded = isPanelExpanded,
-                vertical = !isProgrammeSupported
+                vertical = !isProgrammeSupported,
+                onLongClick = onChannelLongClick
             )
         }
 
@@ -369,7 +375,8 @@ private fun ChannelGallery(
     value: ChannelGalleryValue,
     isPanelExpanded: Boolean,
     modifier: Modifier = Modifier,
-    vertical: Boolean = false
+    vertical: Boolean = false,
+    onLongClick: (Channel) -> Unit
 ) {
     val spacing = LocalSpacing.current
     val lazyListState = rememberLazyListState()
@@ -391,7 +398,8 @@ private fun ChannelGallery(
                         ChannelGalleryItem(
                             channel = channel,
                             isPlaying = isPlaying,
-                            isRoundedShape = !vertical
+                            isRoundedShape = !vertical,
+                            onLongClick = { onLongClick(channel) }
                         )
                         if (vertical) {
                             HorizontalDivider()
@@ -440,12 +448,14 @@ private sealed class ChannelGalleryValue {
     ) : ChannelGalleryValue()
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ChannelGalleryItem(
     channel: Channel,
     isPlaying: Boolean,
     isRoundedShape: Boolean,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onLongClick: () -> Unit
 ) {
     val spacing = LocalSpacing.current
     val helper = LocalHelper.current
@@ -482,6 +492,7 @@ private fun ChannelGalleryItem(
         }
     }
     if (isRoundedShape) {
+        // 使用不带 onClick 的 Card 重载，通过 modifier 处理点击和长按
         Card(
             colors = CardDefaults.cardColors(
                 containerColor = containerColor,
@@ -489,8 +500,10 @@ private fun ChannelGalleryItem(
             ),
             shape = AbsoluteRoundedCornerShape(spacing.medium),
             elevation = CardDefaults.cardElevation(spacing.none),
-            onClick = onClick,
-            modifier = modifier
+            modifier = modifier.combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
         ) {
             text()
         }
@@ -504,7 +517,10 @@ private fun ChannelGalleryItem(
                 headlineColor = contentColor
             ),
             modifier = Modifier
-                .clickable(onClick = onClick)
+                .combinedClickable(
+                    onClick = onClick,
+                    onLongClick = onLongClick
+                )
                 .then(modifier)
         )
     }
