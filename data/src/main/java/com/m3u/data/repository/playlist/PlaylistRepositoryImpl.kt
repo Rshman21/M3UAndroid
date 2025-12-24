@@ -5,11 +5,6 @@ import android.content.Context
 import android.net.Uri
 import androidx.core.net.toUri
 import androidx.work.WorkManager
-import com.m3u.core.architecture.logger.Logger
-import com.m3u.core.architecture.logger.Profiles
-import com.m3u.core.architecture.logger.install
-import com.m3u.core.architecture.logger.post
-import com.m3u.core.architecture.logger.sandBox
 import com.m3u.core.architecture.preferences.PlaylistStrategy
 import com.m3u.core.architecture.preferences.PreferencesKeys
 import com.m3u.core.architecture.preferences.Settings
@@ -59,7 +54,6 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -67,7 +61,6 @@ import java.io.File
 import java.io.InputStream
 import java.io.Reader
 import javax.inject.Inject
-import kotlin.time.Duration.Companion.seconds
 
 private const val BUFFER_M3U_CAPACITY = 500
 private const val BUFFER_XTREAM_CAPACITY = 100
@@ -82,66 +75,48 @@ internal class PlaylistRepositoryImpl @Inject constructor(
     private val xtreamParser: XtreamParser,
     private val workManager: WorkManager,
     @ApplicationContext private val context: Context,
-    private val settings: Settings,
-    delegate: Logger // 注入 Logger 替代 Timber
+    private val settings: Settings
 ) : PlaylistRepository {
-    private val logger = delegate.install(Profiles.REPOS_PLAYLIST)
 
     override suspend fun m3uOrThrow(
         title: String,
         url: String,
         callback: (count: Int) -> Unit
     ) {
-        // 1. 准备阶段
         val internalUrl = url.copyToInternalDirPath()
-        logger.post { "m3uOrThrow: url=$url, internalUrl=$internalUrl" }
-
-        // 临时列表，用于暂存解析成功的频道。只有全部解析成功，才会写入数据库。
+        
+        // 1. 预解析阶段：先将数据下载并解析到内存中，不操作数据库
         val validChannels = mutableListOf<Channel>()
-
-        // 2. 解析阶段 (带有超时保护和异常捕获)
+        
         try {
-            // 设置 20 秒超时，防止遇到死链或解析器卡死
-            withTimeout(20.seconds) {
-                val inputStream = when {
-                    url.isSupportedNetworkUrl() -> openNetworkInput(internalUrl)
-                    url.isSupportedAndroidUrl() -> openAndroidInput(internalUrl)
-                    else -> null
-                } ?: throw IllegalArgumentException("Cannot open input stream for: $internalUrl")
+            val inputStream = when {
+                url.isSupportedNetworkUrl() -> openNetworkInput(internalUrl)
+                url.isSupportedAndroidUrl() -> openAndroidInput(internalUrl)
+                else -> null
+            } ?: throw IllegalArgumentException("Unsupported URL or cannot open stream: $internalUrl")
 
-                inputStream.use { input ->
-                    m3uParser.parse(input.buffered())
-                        .collect { m3uData ->
-                            // 【核心修复】过滤逻辑：
-                            // 1. 去除两端空格
-                            // 2. 忽略空行或以 # 开头的注释行
-                            val cleanUrl = m3uData.url.trim()
-                            if (cleanUrl.isBlank() || cleanUrl.startsWith("#")) {
-                                return@collect // 跳过这一条，继续下一条
-                            }
-
-                            // 有效数据，加入临时列表
-                            validChannels.add(m3uData.toChannel(internalUrl))
-                            
-                            // 更新进度 (仅展示用)
-                            callback(validChannels.size)
-                        }
-                }
+            inputStream.use { input ->
+                m3uParser.parse(input.buffered())
+                    .collect { m3uData ->
+                        // 这里暂时不做复杂的M3U格式修改，仅做基础收集
+                        // 稍后根据你的新思路，可以在这里加过滤逻辑
+                        validChannels.add(m3uData.toChannel(internalUrl))
+                        
+                        // 回调进度仅用于UI展示，不代表写入数据库
+                        callback(validChannels.size)
+                    }
             }
         } catch (e: Exception) {
-            // 如果解析中途失败（超时、网络错误、格式错误），直接抛出异常
-            // 此时数据库尚未被修改，旧数据完好无损
-            logger.post { "M3U parse failed: ${e.message}" }
-            throw e 
+            // 如果下载或解析失败，直接抛出异常。
+            // 此时数据库旧数据还没有被删除，保证了数据安全。
+            throw e
         }
 
-        // 如果文件是空的或者所有链接都被注释掉了
         if (validChannels.isEmpty()) {
-            throw RuntimeException("No valid channels found (check if file is commented out).")
+            throw RuntimeException("No channels found in the playlist.")
         }
 
-        // 3. 数据库写入阶段 (事务处理)
-        // 代码执行到这里说明解析完全成功，现在可以安全地替换数据库了
+        // 2. 数据库写入阶段：只有上面没抛出异常，才会执行这里
         val playlistStrategy = settings[PreferencesKeys.PLAYLIST_STRATEGY]
         val favOrHiddenRelationIds = when (playlistStrategy) {
             PlaylistStrategy.ALL -> emptyList()
@@ -152,20 +127,19 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             else -> channelDao.getFavOrHiddenUrlsByPlaylistUrlNotContainsRelationId(url)
         }
 
-        // 删除旧数据
+        // 此时才安全地删除旧数据
         when (playlistStrategy) {
             PlaylistStrategy.ALL -> channelDao.deleteByPlaylistUrl(url)
             PlaylistStrategy.KEEP -> channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(url)
         }
 
-        // 更新 Playlist 信息
         val playlist = playlistDao.get(internalUrl)?.copy(
             title = title,
             source = DataSource.M3U
         ) ?: Playlist(title, internalUrl, source = DataSource.M3U)
         playlistDao.insertOrReplace(playlist)
 
-        // 过滤并插入新数据
+        // 过滤并批量插入新数据
         val finalChannels = validChannels.filterNot { channel ->
             val relationId = channel.relationId
             when {
@@ -174,13 +148,11 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             }
         }
 
-        // 批量插入
         finalChannels.chunked(BUFFER_M3U_CAPACITY).forEach { batch ->
             channelDao.insertOrReplaceAll(*batch.toTypedArray())
         }
     }
 
-    // Xtream 和其他方法保持原样，仅做 Logger 适配
     override suspend fun xtreamOrThrow(
         title: String,
         basicUrl: String,
@@ -270,7 +242,7 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         var currentCount = 0
         callback(currentCount)
 
-        val cache = createCoroutineCache<Channel>(BUFFER_XTREAM_CAPACITY) { all ->
+        val cache = createCoroutineCache(BUFFER_XTREAM_CAPACITY) { all ->
             currentCount += all.size
             callback(currentCount)
             channelDao.insertOrReplaceAll(*all.toTypedArray())
@@ -338,15 +310,11 @@ internal class PlaylistRepositoryImpl @Inject constructor(
         )
     }
 
-    override suspend fun refresh(url: String) = logger.sandBox {
-        val playlist = get(url) ?: run {
-            logger.post { "Playlist not found for url: $url" }
-            return@sandBox
-        }
-        // 【修正】使用 fromLocal 属性，解决 unresolved reference 错误
+    override suspend fun refresh(url: String) {
+        val playlist = get(url) ?: return
+        // 修正：使用 fromLocal 替代 refreshable，避免编译错误
         if (playlist.fromLocal) {
-            logger.post { "Playlist is from local storage, skipping refresh: $playlist" }
-            return@sandBox
+            return
         }
 
         when (playlist.source) {
@@ -542,7 +510,7 @@ internal class PlaylistRepositoryImpl @Inject constructor(
                     else epgUrls - useCase.epgUrl
                 }
             }
-            // 【核心修复】这里修正为 Upward，而不是 Upgrade
+
             is PlaylistRepository.EpgPlaylistUseCase.Upward -> {
                 val epgUrl = useCase.epgUrl
                 playlistDao.updateEpgUrls(useCase.playlistUrl) { epgUrls ->
