@@ -127,9 +127,12 @@ internal fun Scaffold(
 internal fun Items(
     inner: @Composable (Destination.Root) -> Unit
 ) {
-    Destination.Root.entries.fastForEach { rootDestination ->
-        inner(rootDestination)
-    }
+    Destination.Root.entries
+        // 【修改点】在这里加一个过滤，排除掉 Extension
+        .filter { it.name != "Extension" } 
+        .forEach { rootDestination ->
+            inner(rootDestination)
+        }
 }
 
 @OptIn(ExperimentalHazeMaterialsApi::class)
