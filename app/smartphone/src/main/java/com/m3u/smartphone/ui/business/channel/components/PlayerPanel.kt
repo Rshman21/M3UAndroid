@@ -24,6 +24,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.AbsoluteRoundedCornerShape
@@ -50,7 +51,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -107,7 +107,7 @@ internal fun PlayerPanel(
     onRemindProgramme: (Programme) -> Unit,
     onCancelRemindProgramme: (Programme) -> Unit,
     onRequestClosed: () -> Unit,
-    // 【新增】长按回调
+    // 长按回调
     onChannelLongClick: (Channel) -> Unit
 ) {
     val spacing = LocalSpacing.current
@@ -184,7 +184,6 @@ internal fun PlayerPanel(
                             contentDescription = currentProgramme.title,
                             contentScale = ContentScale.Crop,
                             loading = {
-                                // coil will measure the loading content same with the parent's modifier.
                                 Box {
                                     CircularProgressIndicator(
                                         modifier = Modifier.align(Alignment.Center)
@@ -347,7 +346,7 @@ fun PlayerPanelImpl(
 
         if (isChannelsSupported) {
             ChannelGallery(
-                // TODO
+                // 修复这里：PagingChannel 参数是 Channel 类型，需要 items 扩展
                 value = ChannelGalleryValue.PagingChannel(channels, channelId),
                 isPanelExpanded = isPanelExpanded,
                 vertical = !isProgrammeSupported,
@@ -392,6 +391,7 @@ private fun ChannelGallery(
             is ChannelGalleryValue.PagingChannel -> {
                 val channels = value.channels
                 val channelId = value.channelId
+                // 这里使用 items(count) 是 Int，没问题
                 items(channels.itemCount) { i ->
                     channels[i]?.let { channel ->
                         val isPlaying = channel.id == channelId
@@ -409,6 +409,7 @@ private fun ChannelGallery(
             }
 
             is ChannelGalleryValue.XtreamEpisode -> {
+                // 这里使用 items(List)，需要 import androidx.compose.foundation.lazy.items
                 items(value.episodes) { series ->
                     // TODO
                 }
@@ -492,7 +493,6 @@ private fun ChannelGalleryItem(
         }
     }
     if (isRoundedShape) {
-        // 使用不带 onClick 的 Card 重载，通过 modifier 处理点击和长按
         Card(
             colors = CardDefaults.cardColors(
                 containerColor = containerColor,
