@@ -116,7 +116,29 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             throw RuntimeException("No channels found in the playlist.")
         }
 
-        // 2. 数据库写入阶段：只有上面没抛出异常，才会执行这里
+        // ============================================================
+        // 【核心修改】合并旧的收藏状态
+        // ============================================================
+        // 1. 从数据库中获取旧的频道列表
+        val oldChannels = channelDao.getByPlaylistUrl(internalUrl)
+        
+        // 2. 提取出被标记为“喜欢”的频道 URL 集合
+        val favoriteUrls = oldChannels
+            .filter { it.favourite }
+            .map { it.url }
+            .toSet()
+
+        // 3. 遍历新频道，如果 URL 命中收藏集合，恢复收藏状态
+        if (favoriteUrls.isNotEmpty()) {
+            validChannels.forEach { channel ->
+                if (channel.url in favoriteUrls) {
+                    channel.favourite = true
+                }
+            }
+        }
+        // ============================================================
+
+        // 2. 数据库写入阶段
         val playlistStrategy = settings[PreferencesKeys.PLAYLIST_STRATEGY]
         val favOrHiddenRelationIds = when (playlistStrategy) {
             PlaylistStrategy.ALL -> emptyList()
@@ -127,7 +149,7 @@ internal class PlaylistRepositoryImpl @Inject constructor(
             else -> channelDao.getFavOrHiddenUrlsByPlaylistUrlNotContainsRelationId(url)
         }
 
-        // 此时才安全地删除旧数据
+        // 删除旧数据
         when (playlistStrategy) {
             PlaylistStrategy.ALL -> channelDao.deleteByPlaylistUrl(url)
             PlaylistStrategy.KEEP -> channelDao.deleteByPlaylistUrlIgnoreFavOrHidden(url)
