@@ -25,6 +25,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -58,6 +59,7 @@ import com.m3u.core.util.basic.title
 import com.m3u.data.database.model.AdjacentChannels
 import com.m3u.data.database.model.Channel
 import com.m3u.data.database.model.Playlist
+import com.m3u.data.service.MediaCommand
 import com.m3u.i18n.R.string
 import com.m3u.smartphone.ui.business.channel.components.DlnaDevicesBottomSheet
 import com.m3u.smartphone.ui.business.channel.components.FormatsBottomSheet
@@ -81,6 +83,7 @@ import com.m3u.smartphone.ui.material.ktx.checkPermissionOrRationale
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.launch
 import kotlin.time.Duration.Companion.seconds
 
 @Composable
@@ -94,6 +97,7 @@ fun ChannelRoute(
     val context = LocalContext.current
     val density = LocalDensity.current
     val windowInfo = LocalWindowInfo.current
+    val coroutineScope = rememberCoroutineScope()
 
     val isPanelEnabled by preferenceOf(PreferencesKeys.PLAYER_PANEL)
     val zappingMode by preferenceOf(PreferencesKeys.ZAPPING_MODE)
@@ -141,12 +145,13 @@ fun ChannelRoute(
 
     val maskState = rememberMaskState()
     val pullPanelLayoutState = rememberPullPanelLayoutState()
+    
+    val configuration = LocalConfiguration.current
 
     LaunchedEffect(Unit) {
         pullPanelLayoutState.expand()
     }
 
-    val configuration = LocalConfiguration.current
     LaunchedEffect(configuration.orientation) {
         if (configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
             pullPanelLayoutState.collapse()
@@ -294,7 +299,14 @@ fun ChannelRoute(
                     }
                 },
                 onCancelRemindProgramme = viewModel::onCancelRemindProgramme,
-                onRequestClosed = { pullPanelLayoutState.collapse() }
+                onRequestClosed = { pullPanelLayoutState.collapse() },
+                // 【新增】长按列表频道 -> 播放并自动进入画中画
+                onChannelLongClick = { targetChannel ->
+                    coroutineScope.launch {
+                        helper.play(MediaCommand.Common(targetChannel.id))
+                        helper.enterPipMode(playerState.videoSize)
+                    }
+                }
             )
         },
         content = {
