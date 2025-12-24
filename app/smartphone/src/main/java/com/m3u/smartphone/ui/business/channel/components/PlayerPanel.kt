@@ -1,5 +1,7 @@
 package com.m3u.smartphone.ui.business.channel.components
 
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -51,18 +53,17 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.paging.compose.LazyPagingItems
-import android.content.pm.ActivityInfo
-import android.content.res.Configuration
-import androidx.compose.ui.platform.LocalConfiguration
 import coil.compose.SubcomposeAsyncImage
 import com.m3u.core.foundation.components.AbsoluteSmoothCornerShape
 import com.m3u.core.foundation.components.CircularProgressIndicator
@@ -89,7 +90,6 @@ import kotlinx.datetime.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 
-
 @Composable
 internal fun PlayerPanel(
     title: String,
@@ -107,7 +107,6 @@ internal fun PlayerPanel(
     onRemindProgramme: (Programme) -> Unit,
     onCancelRemindProgramme: (Programme) -> Unit,
     onRequestClosed: () -> Unit,
-    // 长按回调
     onChannelLongClick: (Channel) -> Unit
 ) {
     val spacing = LocalSpacing.current
@@ -346,7 +345,6 @@ fun PlayerPanelImpl(
 
         if (isChannelsSupported) {
             ChannelGallery(
-                // 修复这里：PagingChannel 参数是 Channel 类型，需要 items 扩展
                 value = ChannelGalleryValue.PagingChannel(channels, channelId),
                 isPanelExpanded = isPanelExpanded,
                 vertical = !isProgrammeSupported,
@@ -391,7 +389,6 @@ private fun ChannelGallery(
             is ChannelGalleryValue.PagingChannel -> {
                 val channels = value.channels
                 val channelId = value.channelId
-                // 这里使用 items(count) 是 Int，没问题
                 items(channels.itemCount) { i ->
                     channels[i]?.let { channel ->
                         val isPlaying = channel.id == channelId
@@ -409,7 +406,6 @@ private fun ChannelGallery(
             }
 
             is ChannelGalleryValue.XtreamEpisode -> {
-                // 这里使用 items(List)，需要 import androidx.compose.foundation.lazy.items
                 items(value.episodes) { series ->
                     // TODO
                 }
